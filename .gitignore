@@ -1,0 +1,4 @@
+env
+.swfactory.lock
+__pycache__/
+*.pyc
