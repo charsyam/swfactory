@@ -242,6 +242,44 @@ def subtask_body(parent_number, index, task):
     ])
 
 
+SUBTASK_LINKS_START = "<!-- swfactory-subtask-links:start -->"
+SUBTASK_LINKS_END = "<!-- swfactory-subtask-links:end -->"
+
+
+def parent_body_with_subtask_links(body, repo, tasks, numbers):
+    if len(tasks) != len(numbers):
+        raise ValueError("Every task must have a sub-issue number")
+    lines = [SUBTASK_LINKS_START, "## Sub-tasks", ""]
+    for task, number in zip(tasks, numbers):
+        title = " ".join(task["what"].split())
+        lines.append("- [#{}](https://github.com/{}/issues/{}) — {}".format(
+            number, repo, number, title))
+    lines.append(SUBTASK_LINKS_END)
+    section = "\n".join(lines)
+    start = body.find(SUBTASK_LINKS_START)
+    end = body.find(SUBTASK_LINKS_END)
+    if (start == -1) != (end == -1) or (start != -1 and end < start):
+        raise RuntimeError("Parent issue has an incomplete swfactory sub-task section")
+    if start != -1:
+        return body[:start] + section + body[end + len(SUBTASK_LINKS_END):]
+    original = "\n" + ORIGINAL_MARKER + "\n"
+    marker = body.find(original)
+    if marker != -1:
+        return body[:marker].rstrip("\n") + "\n\n" + section + "\n" + body[marker:]
+    return body.rstrip("\n") + "\n\n" + section if body else section
+
+
+def update_parent_subtask_links(repo, parent_number, tasks, numbers, work_dir):
+    latest = json.loads(gh(repo, "issue", "view", str(parent_number), "--json", "body"))
+    body = latest.get("body") or ""
+    updated = parent_body_with_subtask_links(body, repo, tasks, numbers)
+    if updated != body:
+        with tempfile.TemporaryDirectory(prefix="swfactory-parent-body-", dir=work_dir) as directory:
+            body_path = Path(directory) / "issue.md"
+            body_path.write_text(updated)
+            gh(repo, "issue", "edit", str(parent_number), "--body-file", str(body_path))
+
+
 def api_pages(endpoint):
     pages = json.loads(run(["gh", "api", "--paginate", "--slurp", endpoint]))
     return [item for page in pages for item in page]
@@ -535,6 +573,7 @@ def process_issue(repo, remote, key, checkout, work_dir, owner, issue):
         valid_plan(plan)
         gh(repo, "issue", "comment", str(number), "--body", format_plan(plan))
         subtasks = register_subtasks(repo, number, plan["tasks"], work_dir)
+        update_parent_subtask_links(repo, number, plan["tasks"], subtasks, work_dir)
         task_text = format_plan(plan)
         for index, task in enumerate(plan["tasks"], 1):
             implementation_prompt = (

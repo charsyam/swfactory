@@ -233,6 +233,45 @@ class RephraseTests(unittest.TestCase):
 
 
 class SubtaskTests(unittest.TestCase):
+    def test_parent_body_links_subtasks_without_changing_original(self):
+        tasks = [{"what": "Parse input\n safely"}, {"what": "Report failures"}]
+        original = "First line\n\nSecond line\n"
+        body = "## Specification\nDetails\n\n==== original ====\n\n" + original
+        updated = swfactory.parent_body_with_subtask_links(body, "owner/repo", tasks, [7, 8])
+        self.assertIn("[#7](https://github.com/owner/repo/issues/7) — Parse input safely", updated)
+        self.assertIn("[#8](https://github.com/owner/repo/issues/8) — Report failures", updated)
+        self.assertTrue(updated.endswith("==== original ====\n\n" + original))
+        self.assertEqual(swfactory.parent_body_with_subtask_links(updated, "owner/repo", tasks, [7, 8]),
+                         updated)
+        revised = swfactory.parent_body_with_subtask_links(updated, "owner/repo", tasks, [9, 8])
+        self.assertNotIn("issues/7", revised)
+        self.assertEqual(revised.count(swfactory.SUBTASK_LINKS_START), 1)
+
+    @patch("swfactory.gh")
+    def test_parent_body_is_written_only_when_links_change(self, gh):
+        tasks = [{"what": "Parse input"}]
+        body = "Spec\n\n==== original ====\n\nOriginal"
+        written = []
+
+        def fake_gh(*args):
+            if args[2] == "view":
+                return json.dumps({"body": body})
+            written.append(Path(args[-1]).read_text())
+            return ""
+
+        gh.side_effect = fake_gh
+        with tempfile.TemporaryDirectory() as directory:
+            swfactory.update_parent_subtask_links("owner/repo", 1, tasks, [7], Path(directory))
+            self.assertEqual(gh.call_count, 2)
+            self.assertEqual(gh.call_args_list[-1].args[:4],
+                             ("owner/repo", "issue", "edit", "1"))
+            self.assertEqual(written, [swfactory.parent_body_with_subtask_links(
+                body, "owner/repo", tasks, [7])])
+            gh.reset_mock()
+            body = written[0]
+            swfactory.update_parent_subtask_links("owner/repo", 1, tasks, [7], Path(directory))
+            gh.assert_called_once_with("owner/repo", "issue", "view", "1", "--json", "body")
+
     @patch("swfactory.run")
     @patch("swfactory.api_pages")
     def test_registers_and_reuses_linked_subissue(self, pages, run):
