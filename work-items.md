@@ -9,3 +9,4 @@
 | 5 | Isolate GitHub CLI authentication per target repository and verify write access before issue processing | Implemented |
 | 6 | Register small ordered tasks as GitHub sub-issues and implement them sequentially before parent PR completion | Implemented |
 | 7 | Add direct links to registered sub-issues in the parent issue body while preserving the original request | Implemented |
+| 8 | Require new test cases for every sub-task and publish basic, functional, and integration test execution results | Implemented |

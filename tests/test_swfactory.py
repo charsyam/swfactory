@@ -42,6 +42,45 @@ class PlanTests(unittest.TestCase):
             swfactory.valid_plan({"tasks": [], "integration_tests": ["test"]})
 
     @patch("swfactory.run")
+    def test_verification_requires_added_cases_and_all_test_categories(self, run):
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            (worktree / "test_feature.py").write_text("def test_feature(): pass\n")
+            run.side_effect = ["test_feature.py", ""]
+            result = {
+                "passed": True,
+                "test_cases": [{"task": 1, "path": "test_feature.py", "case": "test_feature",
+                                "behavior": "Feature returns expected result"}],
+                "test_results": [
+                    {"kind": kind, "command": "pytest -q", "output": "1 passed", "passed": True}
+                    for kind in ("basic", "functional", "integration")],
+                "details": "All checks passed",
+            }
+            swfactory.validate_verification(result, worktree, 1)
+            report = swfactory.format_test_report(result)
+            self.assertIn("Task 1: `test_feature.py`", report)
+            self.assertIn("functional: `pytest -q` — PASS; 1 passed", report)
+            run.side_effect = ["test_feature.py", ""]
+            with self.assertRaisesRegex(RuntimeError, "Every sub-task"):
+                swfactory.validate_verification(result, worktree, 2)
+            run.side_effect = ["test_feature.py", ""]
+            result["test_results"] = result["test_results"][:-1]
+            with self.assertRaisesRegex(RuntimeError, "Basic, functional, and integration"):
+                swfactory.validate_verification(result, worktree, 1)
+
+    @patch("swfactory.run")
+    def test_verification_rejects_case_not_in_changed_file(self, run):
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            (worktree / "existing_test.py").write_text("def test_existing(): pass\n")
+            run.side_effect = ["feature.py", ""]
+            result = {"passed": True, "test_cases": [{"task": 1, "path": "existing_test.py",
+                        "case": "test_existing", "behavior": "Old behavior"}],
+                      "test_results": [], "details": "Reported only existing tests"}
+            with self.assertRaisesRegex(RuntimeError, "changed test file"):
+                swfactory.validate_verification(result, worktree, 1)
+
+    @patch("swfactory.run")
     def test_repo_view_passes_repository_as_argument(self, run):
         run.return_value = '{"defaultBranchRef":{"name":"main"}}'
         self.assertEqual(swfactory.default_branch("owner/repo"), "main")
