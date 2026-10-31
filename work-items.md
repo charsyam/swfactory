@@ -10,3 +10,4 @@ The work number is the implementation PR number. GitHub issue numbers identify r
 | 20 | [2. Add independent offline checks for tools, the SSH key, and the local target checkout.](https://github.com/charsyam/swfactory/pull/20) | #1, #17 | Implemented; review pending |
 | 21 | [Sub-issue #18: Add the manual doctor CLI, result policy, documentation, and end-to-end tests.](https://github.com/charsyam/swfactory/pull/21) | #1, #18 | Implemented; review pending |
 | 23 | [Close tracked issues only after task PR merges](https://github.com/charsyam/swfactory/pull/23) | [#22](https://github.com/charsyam/swfactory/issues/22), [#1](https://github.com/charsyam/swfactory/issues/1) | Implemented; review pending |
+| 25 | [Scan latest target commit daily without duplicate proposals](https://github.com/charsyam/swfactory/pull/25) | [#24](https://github.com/charsyam/swfactory/issues/24) | Implemented; review pending |
