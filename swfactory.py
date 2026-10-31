@@ -402,11 +402,11 @@ def write_pr_work_item(worktree, pr_url, parent_number, subtasks, title, plan, t
     doc_path.parent.mkdir(exist_ok=True)
     repo_url = pr_url.rsplit("/pull/", 1)[0]
     issue_links = ", ".join("[#{}]({}/issues/{})".format(child, repo_url, child)
-                            for child in subtasks)
+                            for child in subtasks) or "None"
     doc_path.write_text("# Work #{}: {}\n\nImplementation PR: {}\nParent issue: "
                         "[#{}]({}/issues/{})\nSub-issues: {}\n\n{}\n\n{}\n".format(
                             number, title, pr_url, parent_number, repo_url, parent_number,
-                            issue_links, format_plan(plan), test_report))
+                            issue_links, format_plan(plan), test_report.rstrip()))
     index_path = worktree / "work-items.md"
     if not index_path.exists():
         index_path.write_text("# Work items\n\n| Work number (PR) | Description | Issues | Status |\n"

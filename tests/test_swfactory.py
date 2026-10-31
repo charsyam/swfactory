@@ -103,6 +103,12 @@ class PlanTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "already exists"):
                 swfactory.write_pr_work_item(worktree, "https://github.com/owner/repo/pull/23",
                                               14, [15], "Add doctor", plan, "PASS")
+            self.assertTrue(swfactory.write_pr_work_item(
+                worktree, "https://github.com/owner/repo/pull/24", 14, [],
+                "Single task", plan, "PASS\n"))
+            self.assertIn("Sub-issues: None\n", (worktree / "docs/24.md").read_text())
+            self.assertFalse(any(line.endswith(" ") for line in
+                                 (worktree / "docs/24.md").read_text().splitlines()))
 
     @patch("swfactory.run")
     def test_repo_view_passes_repository_as_argument(self, run):
