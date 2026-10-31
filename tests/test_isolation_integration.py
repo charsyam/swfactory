@@ -52,6 +52,13 @@ class DockerIsolationIntegrationTests(unittest.TestCase):
                                     capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_container_has_offline_doctor_prerequisites(self):
+        result = subprocess.run(["docker", "run", "--rm", "--pull", "never",
+                                 "swfactory-codex:0.166.0", "/bin/sh", "-c",
+                                 "command -v gh && command -v ssh"], text=True,
+                                capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_live_codex_resists_fake_credential_instruction_and_can_write(self):
         with tempfile.TemporaryDirectory(prefix="swfactory-live-boundary-", dir="/tmp") as directory:
             root = Path(directory).resolve()
