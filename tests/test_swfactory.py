@@ -1,6 +1,8 @@
 import json
 import os
 from pathlib import Path
+import re
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -61,7 +63,7 @@ class PlanTests(unittest.TestCase):
             self.assertIn("Task 1: `test_feature.py`", report)
             self.assertIn("functional: `pytest -q` — PASS; 1 passed", report)
             run.side_effect = ["test_feature.py", ""]
-            with self.assertRaisesRegex(RuntimeError, "Every sub-task"):
+            with self.assertRaisesRegex(RuntimeError, "Every task in this PR"):
                 swfactory.validate_verification(result, worktree, 2)
             run.side_effect = ["test_feature.py", ""]
             result["test_results"] = result["test_results"][:-1]
@@ -101,6 +103,12 @@ class PlanTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "already exists"):
                 swfactory.write_pr_work_item(worktree, "https://github.com/owner/repo/pull/23",
                                               14, [15], "Add doctor", plan, "PASS")
+            self.assertTrue(swfactory.write_pr_work_item(
+                worktree, "https://github.com/owner/repo/pull/24", 14, [],
+                "Single task", plan, "PASS\n"))
+            self.assertIn("Sub-issues: None\n", (worktree / "docs/24.md").read_text())
+            self.assertFalse(any(line.endswith(" ") for line in
+                                 (worktree / "docs/24.md").read_text().splitlines()))
 
     @patch("swfactory.run")
     def test_repo_view_passes_repository_as_argument(self, run):
@@ -375,6 +383,119 @@ class SubtaskTests(unittest.TestCase):
             self.assertEqual(swfactory.register_subtasks("owner/repo", 1, [task], Path(directory)), [7])
         run.assert_called_once_with(["gh", "api", "-X", "POST",
                                      "repos/owner/repo/issues/1/sub_issues", "-F", "sub_issue_id=99"])
+
+
+class StackedPullRequestTests(unittest.TestCase):
+    @patch("swfactory.update_parent_subtask_links")
+    @patch("swfactory.register_subtasks", return_value=[7, 8])
+    @patch("swfactory.owner_comments", return_value=[])
+    @patch("swfactory.owner_applied_label", return_value=True)
+    @patch("swfactory.default_branch", return_value="main")
+    @patch("swfactory.gh")
+    @patch("swfactory.codex")
+    def test_each_subtask_has_own_pr_diff_and_pr_numbered_record(
+            self, codex, gh, _branch, _owner, _comments, _subtasks, _links):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            remote = root / "remote.git"
+            swfactory.run(["git", "init", "--bare", str(remote)])
+            swfactory.run(["git", "init", "-b", "main"], cwd=checkout)
+            swfactory.run(["git", "config", "user.name", "Test Owner"], cwd=checkout)
+            swfactory.run(["git", "config", "user.email", "test@example.com"], cwd=checkout)
+            (checkout / "AGENTS.md").write_text("Record work-items.md and docs/{work number}.md.\n")
+            swfactory.run(["git", "add", "AGENTS.md"], cwd=checkout)
+            swfactory.run(["git", "commit", "-m", "Base"], cwd=checkout)
+            swfactory.run(["git", "push", str(remote), "main"], cwd=checkout)
+            work_dir = root / "work"
+            work_dir.mkdir()
+            created = []
+            pr_metadata = {}
+            open_children = {7, 8}
+            fail_second_task_once = [True]
+
+            def fake_gh(_repo, *args):
+                if args[:3] == ("issue", "view", "1"):
+                    return json.dumps(issue(1, "accept", "rephased"))
+                if args[:2] == ("issue", "view"):
+                    return json.dumps({"state": "OPEN" if int(args[2]) in open_children else "CLOSED"})
+                if args[:2] == ("issue", "close"):
+                    open_children.discard(int(args[2]))
+                    return ""
+                if args[:2] == ("pr", "list"):
+                    return json.dumps([pr_metadata[args[args.index("--head") + 1]]]
+                                      if args[args.index("--head") + 1] in pr_metadata else [])
+                if args[:2] == ("pr", "create"):
+                    base = args[args.index("--base") + 1]
+                    head = args[args.index("--head") + 1]
+                    created.append((base, head))
+                    url = "https://github.com/owner/repo/pull/{}".format(19 + len(created))
+                    pr_metadata[head] = {"url": url, "state": "OPEN", "baseRefName": base,
+                                         "title": args[args.index("--title") + 1]}
+                    return url
+                return ""
+
+            def fake_codex(prompt, worktree, output_path=None, schema_path=None, read_only=False):
+                if prompt.startswith("Analyze this GitHub issue"):
+                    output_path.write_text(json.dumps({
+                        "summary": "Two tasks", "why": "Needed", "tasks": [
+                            {"what": "First", "why": "Needed", "how": "Add first module",
+                             "tests": "Check first"},
+                            {"what": "Second", "why": "Needed", "how": "Add second module",
+                             "tests": "Check second"}],
+                        "integration_tests": ["Run all tests"], "questions": []}))
+                elif prompt.startswith("Implement only sub-issue"):
+                    index = int(re.search(r"task (\d+) of", prompt).group(1))
+                    if index == 2 and fail_second_task_once[0]:
+                        fail_second_task_once[0] = False
+                        raise RuntimeError("Temporary task failure")
+                    (worktree / "feature{}.py".format(index)).write_text("VALUE = {}\n".format(index))
+                    (worktree / "test_feature{}.py".format(index)).write_text(
+                        "import unittest\nimport feature{}\n\nclass FeatureTests(unittest.TestCase):\n"
+                        "    def test_feature_{}(self):\n        self.assertEqual(feature{}.VALUE, {})\n".format(
+                            index, index, index, index))
+                else:
+                    index = int(re.search(r"Review only task (\d+)", prompt).group(1))
+                    completed = subprocess.run(["python3", "-m", "unittest", "discover", "-q"],
+                                               cwd=worktree, text=True, capture_output=True)
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    output_path.write_text(json.dumps({
+                        "passed": True,
+                        "test_cases": [{"task": index, "path": "test_feature{}.py".format(index),
+                                        "case": "test_feature_{}".format(index),
+                                        "behavior": "Module value is correct"}],
+                        "test_results": [{"kind": kind, "command": "python3 -m unittest discover -q",
+                                          "output": "{} tests passed".format(index), "passed": True}
+                                         for kind in ("basic", "functional", "integration")],
+                        "details": "All implemented tasks pass"}))
+
+            gh.side_effect = fake_gh
+            codex.side_effect = fake_codex
+            with self.assertRaisesRegex(RuntimeError, "Temporary task failure"):
+                swfactory.process_issue("owner/repo", str(remote), root / "key", checkout,
+                                        work_dir, "owner", issue(1, "accept", "rephased"))
+            self.assertEqual(len(created), 1)
+            swfactory.process_issue("owner/repo", str(remote), root / "key", checkout,
+                                    work_dir, "owner", issue(1, "accept", "rephased"))
+            self.assertEqual(len(created), 2)
+            self.assertEqual(created[0][0], "main")
+            self.assertEqual(created[1][0], created[0][1])
+            first_files = swfactory.run(["git", "--git-dir", str(remote), "diff", "--name-only",
+                                         "refs/heads/main", "refs/heads/{}".format(created[0][1])])
+            second_files = swfactory.run(["git", "--git-dir", str(remote), "diff", "--name-only",
+                                          "refs/heads/{}".format(created[0][1]),
+                                          "refs/heads/{}".format(created[1][1])])
+            self.assertIn("docs/20.md", first_files)
+            self.assertNotIn("feature2.py", first_files)
+            self.assertIn("docs/21.md", second_files)
+            self.assertIn("feature2.py", second_files)
+            self.assertNotIn("feature1.py", second_files)
+            first_run_codex_calls = codex.call_count
+            swfactory.process_issue("owner/repo", str(remote), root / "key", checkout,
+                                    work_dir, "owner", issue(1, "accept", "rephased"))
+            self.assertEqual(len(created), 2)
+            self.assertEqual(codex.call_count, first_run_codex_calls + 1)
 
 
 if __name__ == "__main__":

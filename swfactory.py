@@ -353,12 +353,14 @@ def register_subtasks(repo, parent_number, tasks, work_dir):
 def valid_plan(plan):
     if not plan["tasks"] or not plan["integration_tests"]:
         raise RuntimeError("Codex plan must contain tasks and integration tests")
+    if len(plan["tasks"]) > 100:
+        raise RuntimeError("GitHub permits at most 100 direct sub-issues per parent")
     for task in plan["tasks"]:
         if any(not task[field].strip() for field in ("what", "why", "how", "tests")):
             raise RuntimeError("Codex plan contains an incomplete task")
 
 
-def validate_verification(result, worktree, task_count):
+def validate_verification(result, worktree, expected_tasks):
     if not result["passed"]:
         raise RuntimeError("Verification failed: " + result["details"])
     cases = result["test_cases"]
@@ -366,8 +368,10 @@ def validate_verification(result, worktree, task_count):
     changed = set(run(["git", "diff", "--name-only", "HEAD"], cwd=worktree).splitlines())
     changed.update(run(["git", "ls-files", "--others", "--exclude-standard"],
                        cwd=worktree).splitlines())
-    if {case["task"] for case in cases} != set(range(1, task_count + 1)):
-        raise RuntimeError("Every sub-task must add a reported test case")
+    required = (set(range(1, expected_tasks + 1)) if isinstance(expected_tasks, int)
+                else set(expected_tasks))
+    if {case["task"] for case in cases} != required:
+        raise RuntimeError("Every task in this PR must add a reported test case")
     for case in cases:
         if (not all(str(case[field]).strip() for field in ("path", "case", "behavior"))
                 or case["path"] not in changed
@@ -398,11 +402,11 @@ def write_pr_work_item(worktree, pr_url, parent_number, subtasks, title, plan, t
     doc_path.parent.mkdir(exist_ok=True)
     repo_url = pr_url.rsplit("/pull/", 1)[0]
     issue_links = ", ".join("[#{}]({}/issues/{})".format(child, repo_url, child)
-                            for child in subtasks)
+                            for child in subtasks) or "None"
     doc_path.write_text("# Work #{}: {}\n\nImplementation PR: {}\nParent issue: "
                         "[#{}]({}/issues/{})\nSub-issues: {}\n\n{}\n\n{}\n".format(
                             number, title, pr_url, parent_number, repo_url, parent_number,
-                            issue_links, format_plan(plan), test_report))
+                            issue_links, format_plan(plan), test_report.rstrip()))
     index_path = worktree / "work-items.md"
     if not index_path.exists():
         index_path.write_text("# Work items\n\n| Work number (PR) | Description | Issues | Status |\n"
@@ -418,6 +422,29 @@ def write_pr_work_item(worktree, pr_url, parent_number, subtasks, title, plan, t
             number, pr_url, parent_number, ", ".join("#{}".format(child) for child in subtasks))
     index_path.write_text(index + "\n")
     return True
+
+
+def existing_task_pr(repo, branch, expected_base, child_number, task_title):
+    items = json.loads(gh(repo, "pr", "list", "--state", "all", "--head", branch,
+                          "--limit", "100", "--json", "url,state,baseRefName,title"))
+    if not items:
+        return None
+    if len(items) != 1:
+        raise RuntimeError("Multiple PRs found for task branch " + branch)
+    item = items[0]
+    expected_title = "Sub-issue #{}: {}".format(child_number, task_title[:180])
+    if (item["state"] != "OPEN" or item["baseRefName"] != expected_base
+            or item["title"] != expected_title):
+        raise RuntimeError("Existing task PR does not match the current plan: " + item["url"])
+    return item["url"]
+
+
+def close_completed_subtask(repo, child_number, parent_number, pr_url):
+    child = json.loads(gh(repo, "issue", "view", str(child_number), "--json", "state"))
+    if child["state"] == "OPEN":
+        gh(repo, "issue", "close", str(child_number), "--reason", "completed",
+           "--comment", "Implemented and tested in {} (parent #{}).".format(
+               pr_url, parent_number))
 
 
 def format_test_report(result):
@@ -634,13 +661,16 @@ def process_issue(repo, remote, key, checkout, work_dir, owner, issue):
         return
     gh(repo, "issue", "edit", str(number), "--add-label", "swfactory:running")
     worktree = None
-    branch = "swfactory/issue-{}-{}".format(number, int(time.time()))
+    branch_prefix = "swfactory/issue-{}".format(number)
+    first_branch = branch_prefix + "-task-1"
+    created_branches = []
     git_env = ssh_environment(key)
     try:
         base_branch = default_branch(repo)
         run(["git", "fetch", remote, base_branch], cwd=checkout, env=git_env)
         worktree = Path(tempfile.mkdtemp(prefix="swfactory-{}-".format(number), dir=work_dir))
-        run(["git", "worktree", "add", "-b", branch, str(worktree), "FETCH_HEAD"], cwd=checkout)
+        run(["git", "worktree", "add", "-b", first_branch, str(worktree), "FETCH_HEAD"], cwd=checkout)
+        created_branches.append(first_branch)
         with tempfile.TemporaryDirectory(prefix="swfactory-plan-", dir=work_dir) as plan_dir:
             schema_path = Path(plan_dir) / "schema.json"
             output_path = Path(plan_dir) / "plan.json"
@@ -672,7 +702,29 @@ def process_issue(repo, remote, key, checkout, work_dir, owner, issue):
         subtasks = register_subtasks(repo, number, plan["tasks"], work_dir)
         update_parent_subtask_links(repo, number, plan["tasks"], subtasks, work_dir)
         task_text = format_plan(plan)
+        pr_urls = []
+        last_test_report = None
+        previous_branch = base_branch
         for index, task in enumerate(plan["tasks"], 1):
+            branch = first_branch if index == 1 else "{}-task-{}".format(branch_prefix, index)
+            if index > 1:
+                run(["git", "switch", "-c", branch], cwd=worktree)
+                created_branches.append(branch)
+            existing_url = existing_task_pr(repo, branch, previous_branch,
+                                            subtasks[index - 1], task["what"])
+            if existing_url:
+                run(["git", "fetch", remote, branch], cwd=checkout, env=git_env)
+                fetched_commit = run(["git", "rev-parse", "FETCH_HEAD"], cwd=checkout)
+                run(["git", "reset", "--hard", fetched_commit], cwd=worktree)
+                rules_path = worktree / "AGENTS.md"
+                if (rules_path.is_file() and "docs/{work number}.md" in rules_path.read_text()
+                        and not (worktree / "docs" / "{}.md".format(
+                            existing_url.rsplit("/", 1)[-1])).is_file()):
+                    raise RuntimeError("Existing PR is missing its work record: " + existing_url)
+                pr_urls.append(existing_url)
+                close_completed_subtask(repo, subtasks[index - 1], number, existing_url)
+                previous_branch = branch
+                continue
             implementation_prompt = (
                 "Implement only sub-issue #{} (task {} of {}) for parent GitHub issue #{} "
                 "in this worktree. "
@@ -689,58 +741,74 @@ def process_issue(repo, remote, key, checkout, work_dir, owner, issue):
                      latest["title"],
                      task_text, json.dumps(task, ensure_ascii=False))
             codex(implementation_prompt, worktree)
-        status = run(["git", "status", "--porcelain"], cwd=worktree)
-        if not status:
-            raise RuntimeError("Codex produced no changes")
-        # A separate agent pass checks the finished tree and runs the planned integration tests.
-        verify_prompt = ("Review the implementation of issue #{} against this plan. Ensure each "
-                         "sub-task has an added or extended automated test case for its behavior; "
-                         "add missing cases and fix failures. Run the project's basic test suite, "
-                         "functional tests that exercise the changed behavior, and every planned "
-                         "integration test. Report each added test case with its task number, file, "
-                         "name, and behavior. For each test category report an actual command, its "
-                         "observed output or result summary, and whether it passed. Set passed=true "
-                         "only if all required tests actually ran and passed. Do not commit, push, "
-                         "change GitHub issues, or merge. If any test cannot run, set passed=false "
-                         "and explain why.\n\n{}"
-                         .format(number, task_text))
-        with tempfile.TemporaryDirectory(prefix="swfactory-verify-", dir=work_dir) as verify_dir:
-            schema_path = Path(verify_dir) / "schema.json"
-            output_path = Path(verify_dir) / "result.json"
-            schema_path.write_text(json.dumps(VERIFY_SCHEMA))
-            codex(verify_prompt, worktree, output_path, schema_path)
-            result = json.loads(output_path.read_text())
-        validate_verification(result, worktree, len(plan["tasks"]))
-        run(["git", "diff", "--check"], cwd=worktree)
-        run(["git", "add", "-A"], cwd=worktree)
-        run(["git", "commit", "-m", "Implement issue #{}: {}".format(number, latest["title"])], cwd=worktree)
-        run(["git", "push", remote, "HEAD:refs/heads/{}".format(branch)], cwd=worktree, env=git_env)
-        test_report = format_test_report(result)
-        pr_body = ("Closes #{}\n\n{}\n\n{}\n\n"
-                   "Merge is reserved for the repository owner.").format(number, task_text, test_report)
-        pr_url = gh(repo, "pr", "create", "--base", base_branch, "--head", branch,
-                    "--title", "Issue #{}: {}".format(number, latest["title"]), "--body", pr_body)
-        if write_pr_work_item(worktree, pr_url, number, subtasks, latest["title"], plan, test_report):
+            if not run(["git", "status", "--porcelain"], cwd=worktree):
+                raise RuntimeError("Codex produced no changes for sub-issue #{}".format(subtasks[index - 1]))
+            final_task = index == len(plan["tasks"])
+            integration_checks = plan["integration_tests"] if final_task else [task["tests"]]
+            verify_prompt = (
+                "Review only task {} (sub-issue #{}) for parent issue #{}. Ensure this task "
+                "adds or extends an automated test case for its behavior; add a missing case "
+                "and fix failures. Run the project's basic test suite, functional tests for "
+                "this task, and meaningful integration checks for the code implemented so far. "
+                "{} Report the added test case with task number {}, file, name, and behavior. "
+                "For each basic, functional, and integration category report the actual command, "
+                "observed output or result summary, and pass status. Set passed=true only if "
+                "all required tests actually ran and passed. Do not commit, push, change GitHub "
+                "issues, or merge. If any check cannot run, set passed=false and explain why.\n\n"
+                "Task:\n{}\n\nRequired integration checks:\n{}"
+            ).format(index, subtasks[index - 1], number,
+                     "Run every parent integration test now." if final_task else
+                     "The full parent integration suite runs with the final task.", index,
+                     json.dumps(task, ensure_ascii=False),
+                     "\n".join("- " + check for check in integration_checks))
+            with tempfile.TemporaryDirectory(prefix="swfactory-verify-", dir=work_dir) as verify_dir:
+                schema_path = Path(verify_dir) / "schema.json"
+                output_path = Path(verify_dir) / "result.json"
+                schema_path.write_text(json.dumps(VERIFY_SCHEMA))
+                codex(verify_prompt, worktree, output_path, schema_path)
+                result = json.loads(output_path.read_text())
+            validate_verification(result, worktree, {index})
             run(["git", "diff", "--check"], cwd=worktree)
-            run(["git", "add", "work-items.md", "docs/{}.md".format(pr_url.rsplit("/", 1)[-1])],
-                cwd=worktree)
-            run(["git", "commit", "-m", "Record work item for {}".format(pr_url)], cwd=worktree)
+            run(["git", "add", "-A"], cwd=worktree)
+            run(["git", "commit", "-m", "Implement sub-issue #{}: {}".format(
+                subtasks[index - 1], task["what"][:120])], cwd=worktree)
             run(["git", "push", remote, "HEAD:refs/heads/{}".format(branch)],
                 cwd=worktree, env=git_env)
-        for subtask_number in subtasks:
-            child = json.loads(gh(repo, "issue", "view", str(subtask_number), "--json", "state"))
-            if child["state"] == "OPEN":
-                gh(repo, "issue", "close", str(subtask_number), "--reason", "completed",
-                   "--comment", "Implemented and integration-tested in {} (parent #{}).".format(
-                       pr_url, number))
+            test_report = format_test_report(result)
+            last_test_report = test_report
+            child_plan = {"summary": task["what"], "why": task["why"], "tasks": [task],
+                          "integration_tests": integration_checks}
+            pr_body = ("Parent issue: #{}\nCloses #{}\n{}\n\n{}\n\n{}\n\n"
+                       "Base branch: `{}`. Merge this PR before later task PRs. "
+                       "Merging is reserved for the owner.").format(
+                           number, subtasks[index - 1],
+                           "Closes #{}\n".format(number) if final_task else "",
+                           format_plan(child_plan), test_report, previous_branch)
+            pr_url = gh(repo, "pr", "create", "--base", previous_branch, "--head", branch,
+                        "--title", "Sub-issue #{}: {}".format(subtasks[index - 1], task["what"][:180]),
+                        "--body", pr_body)
+            if write_pr_work_item(worktree, pr_url, number, [subtasks[index - 1]],
+                                  task["what"], child_plan, test_report):
+                run(["git", "diff", "--check"], cwd=worktree)
+                run(["git", "add", "work-items.md", "docs/{}.md".format(
+                    pr_url.rsplit("/", 1)[-1])], cwd=worktree)
+                run(["git", "commit", "-m", "Record work item for {}".format(pr_url)],
+                    cwd=worktree)
+                run(["git", "push", remote, "HEAD:refs/heads/{}".format(branch)],
+                    cwd=worktree, env=git_env)
+            pr_urls.append(pr_url)
+            close_completed_subtask(repo, subtasks[index - 1], number, pr_url)
+            previous_branch = branch
         gh(repo, "issue", "edit", str(number), "--add-label", "done", "--remove-label", "swfactory:running")
         try:
+            completion_report = last_test_report or "테스트 실행 결과는 각 PR 설명에 기록되어 있습니다."
             gh(repo, "issue", "comment", str(number), "--body",
-               "구현 및 테스트 완료. 검토 후 직접 병합해 주세요: {}\n\n{}".format(
-                   pr_url, test_report))
+               "구현 및 테스트 완료. 아래 PR을 순서대로 검토하고 직접 병합해 주세요:\n{}\n\n{}".format(
+                   "\n".join("{}. {}".format(i, url) for i, url in enumerate(pr_urls, 1)),
+                   completion_report))
         except Exception as error:
             print("Could not post completion comment: {}".format(error), file=sys.stderr)
-        print("Completed issue #{}: {}".format(number, pr_url), flush=True)
+        print("Completed issue #{}: {} PRs".format(number, len(pr_urls)), flush=True)
     except Exception as error:
         message = "swfactory 실패: {}. 원인을 수정한 뒤 `swfactory:failed` 라벨을 제거하면 재시도합니다.".format(error)
         try:
@@ -751,8 +819,10 @@ def process_issue(repo, remote, key, checkout, work_dir, owner, issue):
         raise
     finally:
         if worktree:
-            for command in (["git", "worktree", "remove", "--force", str(worktree)],
-                            ["git", "branch", "-D", branch]):
+            commands = [["git", "worktree", "remove", "--force", str(worktree)]]
+            commands.extend(["git", "branch", "-D", branch]
+                            for branch in created_branches)
+            for command in commands:
                 try:
                     run(command, cwd=checkout)
                 except Exception as cleanup_error:
