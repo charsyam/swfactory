@@ -172,6 +172,160 @@ class PlanTests(unittest.TestCase):
             swfactory.verify_github_access("owner/repo")
 
 
+class ConfigurationTests(unittest.TestCase):
+    def test_missing_env_reports_each_required_setting_without_running_git(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(swfactory, "ROOT", Path(directory)), patch("swfactory.run") as run:
+                result = swfactory.validate_configuration()
+        self.assertEqual([finding.name for finding in result.findings],
+                         ["env", "GITHUB_REPOGITORY", "GITHUB_SSH_KEY_PATH", "PROJECT_PATH"])
+        self.assertNotIn(directory, repr(result.findings))
+        run.assert_not_called()
+
+    def test_invalid_settings_are_independent_and_redacted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "env").write_text(
+                "GITHUB_REPOGITORY=secret-invalid-remote\n"
+                "GITHUB_SSH_KEY_PATH=secret-missing-key\n"
+                "PROJECT_PATH=secret-missing-project\n"
+                "WORK_DIR=\n")
+            with patch.object(swfactory, "ROOT", root):
+                result = swfactory.validate_configuration()
+                self.assertEqual([finding.name for finding in result.findings],
+                                 ["GITHUB_REPOGITORY", "GITHUB_SSH_KEY_PATH", "PROJECT_PATH"])
+                for secret in ("secret-invalid-remote", "secret-missing-key", "secret-missing-project"):
+                    self.assertNotIn(secret, repr(result.findings))
+                (root / "env").write_text("GITHUB_REPOGITORY=git@github.com:owner/repo.git\n")
+                self.assertEqual([finding.name for finding in swfactory.validate_configuration().findings],
+                                 ["GITHUB_SSH_KEY_PATH", "PROJECT_PATH"])
+
+    def test_each_missing_required_value_has_a_named_finding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key = root / "key"
+            key.touch()
+            project = root / "project"
+            project.mkdir()
+            swfactory.run(["git", "init"], cwd=project)
+            swfactory.run(["git", "remote", "add", "origin", "git@github.com:owner/repo.git"], cwd=project)
+            settings = {"GITHUB_REPOGITORY": "git@github.com:owner/repo.git",
+                        "GITHUB_SSH_KEY_PATH": str(key), "PROJECT_PATH": str(project)}
+            with patch.object(swfactory, "ROOT", root):
+                for missing in settings:
+                    with self.subTest(missing=missing):
+                        (root / "env").write_text("".join("{}={}\n".format(name, value)
+                            for name, value in settings.items() if name != missing))
+                        self.assertEqual([finding.name for finding in
+                                          swfactory.validate_configuration().findings], [missing])
+
+    def test_paths_expand_home_and_default_work_dir(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "key").touch()
+            (root / "project").mkdir()
+            swfactory.run(["git", "init"], cwd=root / "project")
+            swfactory.run(["git", "remote", "add", "origin", "git@github.com:owner/repo.git"],
+                          cwd=root / "project")
+            (root / "env").write_text("GITHUB_REPOGITORY=git@github.com:owner/repo.git\n"
+                                      "GITHUB_SSH_KEY_PATH=~/key\nPROJECT_PATH=~/project\n")
+            with patch.object(swfactory, "ROOT", root), patch.dict(os.environ, {"HOME": str(root)}):
+                result = swfactory.validate_configuration()
+            self.assertEqual(result.findings, ())
+            self.assertEqual(result.values.key, root / "key")
+            self.assertEqual(result.values.project, (root / "project").resolve())
+            self.assertEqual(result.values.work_dir, Path("/tmp").resolve())
+
+    def test_overrides_select_valid_values_and_diagnostics_do_not_create_work_dir(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key = root / "key"
+            key.write_text("key")
+            project = root / "project"
+            project.mkdir()
+            swfactory.run(["git", "init"], cwd=project)
+            swfactory.run(["git", "remote", "add", "origin", "https://github.com/OWNER/Target.git"], cwd=project)
+            work_dir = root / "new-work"
+            (root / "env").write_text(
+                "GITHUB_REPOGITORY=invalid\nGITHUB_SSH_KEY_PATH={}\n"
+                "PROJECT_PATH=missing\nWORK_DIR={}\n".format(key, work_dir))
+            with patch.object(swfactory, "ROOT", root):
+                self.assertEqual([finding.name for finding in swfactory.validate_configuration(
+                    "git@github.com:owner/target.git").findings], ["PROJECT_PATH"])
+                self.assertEqual([finding.name for finding in swfactory.validate_configuration(
+                    project_override=str(project)).findings], ["GITHUB_REPOGITORY"])
+                result = swfactory.validate_configuration(
+                    "git@github.com:owner/target.git", str(project))
+                self.assertEqual(result.findings, ())
+                self.assertFalse(work_dir.exists())
+                expected = ("owner/target", "git@github.com:owner/target.git", key,
+                            project.resolve(), work_dir.resolve())
+                self.assertEqual((result.values.repository, result.values.remote, result.values.key,
+                                  result.values.project, result.values.work_dir), expected)
+                self.assertEqual(swfactory.config("git@github.com:owner/target.git", str(project)), expected)
+                self.assertTrue(work_dir.is_dir())
+
+    def test_config_hides_local_git_stderr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key = root / "key"
+            key.touch()
+            project = root / "project"
+            project.mkdir()
+            (root / "env").write_text("GITHUB_REPOGITORY=git@github.com:owner/repo.git\n"
+                                      "GITHUB_SSH_KEY_PATH={}\nPROJECT_PATH={}\n".format(key, project))
+            with patch.object(swfactory, "ROOT", root), patch("swfactory.run",
+                    side_effect=RuntimeError("secret subprocess stderr")):
+                with self.assertRaisesRegex(RuntimeError, "PROJECT_PATH is not a Git repository root") as error:
+                    swfactory.config()
+            self.assertNotIn("secret", str(error.exception))
+
+    def test_diagnostics_report_checkout_and_origin_errors_without_git_stderr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key = root / "key"
+            key.touch()
+            project = root / "project"
+            project.mkdir()
+            work_dir = root / "work"
+            (root / "env").write_text(
+                "GITHUB_REPOGITORY=git@github.com:owner/repo.git\n"
+                "GITHUB_SSH_KEY_PATH={}\nPROJECT_PATH={}\nWORK_DIR={}\n".format(
+                    key, project, work_dir))
+            with patch.object(swfactory, "ROOT", root):
+                result = swfactory.validate_configuration()
+                self.assertEqual([finding.message for finding in result.findings],
+                                 ["PROJECT_PATH is not a Git repository root"])
+                swfactory.run(["git", "init"], cwd=project)
+                result = swfactory.validate_configuration()
+                self.assertEqual([finding.message for finding in result.findings],
+                                 ["PROJECT_PATH does not have an origin remote"])
+                swfactory.run(["git", "remote", "add", "origin",
+                               "https://github.com/other/repo.git"], cwd=project)
+                result = swfactory.validate_configuration()
+                self.assertEqual([finding.message for finding in result.findings],
+                                 ["PROJECT_PATH origin does not match GITHUB_REPOGITORY"])
+                self.assertFalse(work_dir.exists())
+                with patch("swfactory.run", side_effect=RuntimeError("secret subprocess stderr")):
+                    result = swfactory.validate_configuration()
+                self.assertNotIn("secret", repr(result.findings))
+                self.assertEqual(result.findings[0].name, "PROJECT_PATH")
+
+    def test_work_dir_may_be_an_ancestor_of_project(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key = root / "key"
+            key.touch()
+            project = root / "project"
+            project.mkdir()
+            swfactory.run(["git", "init"], cwd=project)
+            swfactory.run(["git", "remote", "add", "origin", "git@github.com:owner/repo.git"], cwd=project)
+            (root / "env").write_text("GITHUB_REPOGITORY=git@github.com:owner/repo.git\n"
+                                      "GITHUB_SSH_KEY_PATH={}\nPROJECT_PATH={}\nWORK_DIR={}\n".format(
+                                          key, project, root))
+            with patch.object(swfactory, "ROOT", root):
+                self.assertEqual(swfactory.validate_configuration().findings, ())
+
 class ScanTests(unittest.TestCase):
     @patch("swfactory.gh")
     @patch("swfactory.codex")
