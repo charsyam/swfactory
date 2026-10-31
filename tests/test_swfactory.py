@@ -30,6 +30,13 @@ class QueueTests(unittest.TestCase):
 
 
 class PlanTests(unittest.TestCase):
+    def test_controller_owned_pr_checks_are_not_sent_to_local_verifier(self):
+        checks = ["Run python3 -m unittest discover -s tests -v",
+                  "Before retrying, read PR #19 state, head, base and title",
+                  "gh pr view 19 --json state",
+                  "Run doctor with invalid config and inspect exit code"]
+        self.assertEqual(swfactory.local_integration_checks(checks), [checks[0], checks[3]])
+
     def test_plan_has_required_issue_sections(self):
         plan = {"summary": "Feature", "why": "Needed", "tasks": [
             {"what": "Parse", "why": "Input", "how": "Validate and parse", "tests": "Invalid input"}],
@@ -58,6 +65,9 @@ class PlanTests(unittest.TestCase):
                     for kind in ("basic", "functional", "integration")],
                 "details": "All checks passed",
             }
+            swfactory.validate_verification(result, worktree, 1)
+            result["test_cases"][0]["case"] = "test_feature.FeatureTests.test_feature"
+            run.side_effect = ["test_feature.py", ""]
             swfactory.validate_verification(result, worktree, 1)
             report = swfactory.format_test_report(result)
             self.assertIn("Task 1: `test_feature.py`", report)
@@ -386,6 +396,67 @@ class SubtaskTests(unittest.TestCase):
 
 
 class StackedPullRequestTests(unittest.TestCase):
+    @patch("swfactory.owner_applied_label", return_value=True)
+    @patch("swfactory.gh")
+    def test_merge_reconciliation_waits_for_every_pr_and_closes_once(self, gh, _owner):
+        parent = issue(1, "accept", "done")
+        parent["body"] = (swfactory.SUBTASK_LINKS_START + "\n"
+                          "- [#16](https://github.com/owner/repo/issues/16) — first\n"
+                          "- [#17](https://github.com/owner/repo/issues/17) — second\n"
+                          + swfactory.SUBTASK_LINKS_END)
+        states = {16: "OPEN", 17: "OPEN", 1: "OPEN"}
+        pr_states = {1: "MERGED", 2: "OPEN"}
+        closed = []
+
+        def fake_gh(_repo, *args):
+            if args[:2] == ("issue", "list"):
+                return json.dumps([parent] if states[1] == "OPEN" else [])
+            if args[:2] == ("pr", "list"):
+                branch = args[args.index("--head") + 1]
+                index = int(branch.rsplit("-", 1)[-1])
+                return json.dumps([{"url": "https://github.com/owner/repo/pull/{}".format(18 + index),
+                                    "state": pr_states[index], "headRefName": branch,
+                                    "title": "Sub-issue #{}: task".format(15 + index)}])
+            if args[:2] == ("issue", "view"):
+                return json.dumps({"state": states[int(args[2])],
+                                   "labels": [{"name": "swfactory:subtask"}]})
+            if args[:2] == ("issue", "close"):
+                child = int(args[2])
+                states[child] = "CLOSED"
+                closed.append(child)
+                return ""
+            raise AssertionError(args)
+
+        gh.side_effect = fake_gh
+        swfactory.reconcile_merged_issues("owner/repo", "owner")
+        self.assertEqual(closed, [16])
+        pr_states[2] = "MERGED"
+        swfactory.reconcile_merged_issues("owner/repo", "owner")
+        self.assertEqual(closed, [16, 17, 1])
+        swfactory.reconcile_merged_issues("owner/repo", "owner")
+        self.assertEqual(closed, [16, 17, 1])
+
+    @patch("swfactory.owner_applied_label", return_value=True)
+    @patch("swfactory.gh")
+    def test_unmerged_or_unmapped_pr_never_closes_parent(self, gh, _owner):
+        parent = issue(1, "accept", "done")
+        parent["body"] = (swfactory.SUBTASK_LINKS_START + "\n"
+                          "- [#16](https://github.com/owner/repo/issues/16)\n"
+                          + swfactory.SUBTASK_LINKS_END)
+        gh.side_effect = [json.dumps([parent]), json.dumps([])]
+        swfactory.reconcile_merged_issues("owner/repo", "owner")
+        self.assertEqual(gh.call_count, 2)
+
+    @patch("swfactory.gh")
+    def test_existing_task_pr_uses_stable_child_and_base_on_replan(self, gh):
+        item = {"url": "https://github.com/owner/repo/pull/20", "state": "OPEN",
+                "baseRefName": "main", "title": "Sub-issue #17: Original task wording"}
+        gh.return_value = json.dumps([item])
+        self.assertEqual(swfactory.existing_task_pr("owner/repo", "swfactory/issue-1-task-2",
+                                                     "main", 17), item["url"])
+        with self.assertRaisesRegex(RuntimeError, "does not match"):
+            swfactory.existing_task_pr("owner/repo", "swfactory/issue-1-task-2", "main", 18)
+
     @patch("swfactory.update_parent_subtask_links")
     @patch("swfactory.register_subtasks", return_value=[7, 8])
     @patch("swfactory.owner_comments", return_value=[])
@@ -419,7 +490,8 @@ class StackedPullRequestTests(unittest.TestCase):
                 if args[:3] == ("issue", "view", "1"):
                     return json.dumps(issue(1, "accept", "rephased"))
                 if args[:2] == ("issue", "view"):
-                    return json.dumps({"state": "OPEN" if int(args[2]) in open_children else "CLOSED"})
+                    return json.dumps({"state": "OPEN" if int(args[2]) in open_children else "CLOSED",
+                                       "labels": []})
                 if args[:2] == ("issue", "close"):
                     open_children.discard(int(args[2]))
                     return ""
