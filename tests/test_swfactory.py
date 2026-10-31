@@ -386,7 +386,8 @@ class OfflineCheckTests(unittest.TestCase):
             self.assertEqual((finding.name, finding.status), ("python", "FAIL"))
             self.assertIn("3.7", finding.action)
 
-    def test_checkout_root_origin_and_work_dir_cases(self):
+    @patch("swfactory.shutil.which", return_value="/available/tool")
+    def test_checkout_root_origin_and_work_dir_cases(self, _which):
         for origin, expected_origin in (("git@github.com:owner/repo.git", "PASS"),
                                         ("https://github.com/OWNER/REPO", "PASS"),
                                         (None, "FAIL"),
@@ -976,7 +977,7 @@ class SubtaskTests(unittest.TestCase):
     def test_registers_and_reuses_linked_subissue(self, pages, run):
         task = {"what": "Add option", "why": "Useful", "how": "Parse then report",
                 "tests": "Check exit code"}
-        pages.side_effect = [[], []]
+        pages.side_effect = [[], [], []]
         created = {}
 
         def fake_run(args):
@@ -1007,12 +1008,196 @@ class SubtaskTests(unittest.TestCase):
                 "tests": "Check exit code"}
         orphan = {"id": 99, "number": 7, "body": swfactory.subtask_body(1, 1, task),
                   "state": "open"}
-        pages.side_effect = [[], [orphan]]
+        pages.side_effect = [[], [orphan], []]
         run.return_value = ""
         with tempfile.TemporaryDirectory() as directory:
             self.assertEqual(swfactory.register_subtasks("owner/repo", 1, [task], Path(directory)), [7])
         run.assert_called_once_with(["gh", "api", "-X", "POST",
                                      "repos/owner/repo/issues/1/sub_issues", "-F", "sub_issue_id=99"])
+
+
+class TaskContinuityTests(unittest.TestCase):
+    def setUp(self):
+        self.tasks = [{"what": "Add option", "why": "Useful", "how": "Parse and report",
+                       "tests": "Check exit code"},
+                      {"what": "Document option", "why": "Discovery", "how": "Update help",
+                       "tests": "Check help"}]
+        self.children = [{"id": index + 90, "number": index + 6, "state": "open",
+                          "body": swfactory.subtask_body(1, index, task)}
+                         for index, task in enumerate(self.tasks, 1)]
+
+    def exercise(self, proposed=None, output=None, reject=False, children=None, prs=True):
+        children = self.children if children is None else children
+        proposed = self.tasks if proposed is None else proposed
+        if output is None:
+            output = {"comparisons": [{"position": index, "result": "equivalent",
+                                       "reason": "Same required behavior"}
+                                      for index in range(1, len(proposed) + 1)]}
+        captured = []
+
+        def compare(prompt, cwd, output_path, schema_path, read_only=False):
+            self.assertTrue(read_only)
+            self.assertIn("untrusted task data", prompt)
+            captured.append(prompt)
+            Path(output_path).write_text(json.dumps(output))
+
+        pulls = [{"head": {"ref": "swfactory/issue-1-task-1"}}] if prs else []
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("swfactory.api_pages", side_effect=[children, children, pulls]), \
+                patch("swfactory.codex", side_effect=compare) as agent, \
+                patch("swfactory.run") as run, patch("swfactory.gh") as gh:
+            if reject:
+                with self.assertRaisesRegex(RuntimeError, "continuity"):
+                    swfactory.register_subtasks("owner/repo", 1, proposed, Path(directory))
+                # No child attachment, creation, edit, implementation, or push can precede rejection.
+                run.assert_not_called()
+                gh.assert_not_called()
+            else:
+                result = swfactory.register_subtasks("owner/repo", 1, proposed, Path(directory))
+                self.assertEqual(result, [child["number"] for child in children])
+            if not prs:
+                agent.assert_not_called()
+        return captured
+
+    def test_unchanged_and_wording_only_changes_preserve_previous_evidence(self):
+        self.exercise()
+        proposed = [dict(task) for task in self.tasks]
+        proposed[0]["what"] = "Introduce option"
+        prompt = self.exercise(proposed=proposed)[0]
+        evidence = json.loads(prompt.split("\n", 1)[1])
+        self.assertEqual(evidence["previous"][0]["body"], self.children[0]["body"])
+        self.assertEqual(evidence["proposed"][0]["what"], "Introduce option")
+
+    def test_added_removed_and_missing_history_fail(self):
+        for tasks in (self.tasks[:1], self.tasks + [self.tasks[0]]):
+            with self.subTest(tasks=tasks):
+                self.exercise(proposed=tasks, reject=True)
+        self.exercise(children=[], reject=True)
+
+    def test_reordering_and_behavior_changes_fail(self):
+        for proposed in (list(reversed(self.tasks)),
+                         [dict(self.tasks[0], how="Delete existing data"), self.tasks[1]]):
+            self.exercise(proposed=proposed, reject=True, output={"comparisons": [
+                {"position": 1, "result": "changed", "reason": "Required behavior moved or changed"},
+                {"position": 2, "result": "equivalent", "reason": "Same"}]})
+
+    def test_uncertain_and_malformed_comparisons_fail(self):
+        for output in ({}, [], {"comparisons": []}, {"comparisons": [None, None]},
+                       {"comparisons": [{"position": 1, "result": "uncertain", "reason": "Unknown"},
+                                        {"position": 2, "result": "equivalent", "reason": "Same"}]},
+                       {"comparisons": [{"position": 1, "result": "equivalent", "reason": ""},
+                                        {"position": 2, "result": "equivalent", "reason": "Same"}]}):
+            with self.subTest(output=output):
+                self.exercise(output=output, reject=True)
+
+    def test_incomplete_previous_description_fails(self):
+        children = [dict(child) for child in self.children]
+        children[0]["body"] = swfactory.subtask_marker(1, 1)
+        self.exercise(children=children, reject=True)
+
+    def test_malformed_positions_and_extra_fields_fail(self):
+        valid = [{"position": i, "result": "equivalent", "reason": "Same behavior"}
+                 for i in (1, 2)]
+        for comparisons in ([valid[0], valid[0]], list(reversed(valid)),
+                            [dict(valid[0], position=True), valid[1]],
+                            [dict(valid[0], extra="unexpected"), valid[1]],
+                            [dict(valid[0], reason=42), valid[1]]):
+            with self.subTest(comparisons=comparisons):
+                self.exercise(output={"comparisons": comparisons}, reject=True)
+
+    def test_invalid_json_or_missing_comparison_output_prevents_writes(self):
+        for payload in ("not JSON", None):
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:
+                def compare(prompt, cwd, output, schema, read_only=False):
+                    self.assertTrue(read_only)
+                    if payload is not None:
+                        Path(output).write_text(payload)
+
+                with patch("swfactory.api_pages", side_effect=[self.children, self.children,
+                           [{"head": {"ref": "swfactory/issue-1-task-1"}}]]), \
+                        patch("swfactory.codex", side_effect=compare), \
+                        patch("swfactory.run") as run, patch("swfactory.gh") as gh:
+                    with self.assertRaisesRegex(RuntimeError, "continuity"):
+                        swfactory.register_subtasks("owner/repo", 1, self.tasks, Path(directory))
+                    run.assert_not_called()
+                    gh.assert_not_called()
+
+    def test_wording_edits_follow_comparison_of_all_original_bodies(self):
+        proposed = [dict(task, what="Reworded: " + task["what"]) for task in self.tasks]
+        events = []
+
+        def compare(prompt, cwd, output, schema, read_only=False):
+            self.assertTrue(read_only)
+            data = json.loads(prompt.split("\n", 1)[1])
+            self.assertEqual([item["body"] for item in data["previous"]],
+                             [child["body"] for child in self.children])
+            self.assertEqual(data["proposed"], proposed)
+            events.append("compare")
+            Path(output).write_text(json.dumps({"comparisons": [
+                {"position": i, "result": "equivalent", "reason": "Wording only"}
+                for i in (1, 2)]}))
+
+        def edit(repo, *args):
+            self.assertEqual(events[0], "compare")
+            self.assertEqual(args[:2], ("issue", "edit"))
+            position = int(args[2]) - 7
+            self.assertEqual(Path(args[-1]).read_text(),
+                             swfactory.subtask_body(1, position + 1, proposed[position]))
+            events.append("edit")
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("swfactory.api_pages", side_effect=[self.children, self.children,
+                      [{"head": {"ref": "swfactory/issue-1-task-1"}}]]), \
+                patch("swfactory.codex", side_effect=compare), \
+                patch("swfactory.gh", side_effect=edit), patch("swfactory.run") as run:
+            self.assertEqual(swfactory.register_subtasks(
+                "owner/repo", 1, proposed, Path(directory)), [7, 8])
+            run.assert_not_called()
+        self.assertEqual(events, ["compare", "edit", "edit"])
+
+    def test_no_prs_requires_no_comparison(self):
+        self.exercise(prs=False)
+
+    def test_process_rejection_uses_failure_path_before_implementation_or_push(self):
+        plan = {"summary": "Plan", "why": "Needed", "tasks": self.tasks,
+                "questions": [], "integration_tests": ["Run tests"]}
+        def agent(prompt, cwd, output, schema, read_only=False):
+            self.assertTrue(read_only)
+            Path(output).write_text(json.dumps(plan if "Split it" in prompt else {
+                "comparisons": [{"position": i, "result": "changed", "reason": "Scope changed"}
+                                for i in (1, 2)]}))
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("swfactory.gh", return_value=json.dumps(issue(1, "accept"))) as gh, \
+                patch("swfactory.owner_applied_label", return_value=True), \
+                patch("swfactory.owner_comments", return_value=[]), \
+                patch("swfactory.default_branch", return_value="main"), \
+                patch("swfactory.run", return_value="") as run, \
+                patch("swfactory.codex", side_effect=agent) as codex, \
+                patch("swfactory.api_pages", side_effect=[self.children, self.children,
+                      [{"head": {"ref": "swfactory/issue-1-task-1"}}]]):
+            root = Path(directory)
+            with self.assertRaisesRegex(RuntimeError, "continuity"):
+                swfactory.process_issue("owner/repo", "remote", root / "key", root,
+                                        root, "owner", issue(1, "accept"))
+            self.assertEqual(codex.call_count, 2)
+            self.assertTrue(all(call.kwargs.get("read_only") for call in codex.call_args_list))
+            self.assertFalse(any("push" in call.args[0] for call in run.call_args_list))
+            self.assertFalse(any(call.args[1:3] == ("issue", "edit") and
+                                 call.args[3] in ("7", "8") for call in gh.call_args_list))
+            self.assertTrue(any("swfactory:failed" in call.args for call in gh.call_args_list))
+            self.assertTrue(any(call.args[0][:3] == ["git", "worktree", "remove"]
+                                for call in run.call_args_list))
+
+    @patch("swfactory.codex")
+    @patch("swfactory.api_pages", side_effect=[[], [], []])
+    @patch("swfactory.run")
+    def test_fresh_issue_creates_child_without_comparison(self, run, pages, agent):
+        run.side_effect = [json.dumps({"id": 99, "number": 7, "state": "open",
+                                      "body": swfactory.subtask_body(1, 1, self.tasks[0])}), ""]
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(swfactory.register_subtasks(
+                "owner/repo", 1, self.tasks[:1], Path(directory)), [7])
+        agent.assert_not_called()
 
 
 class StackedPullRequestTests(unittest.TestCase):
