@@ -3,6 +3,7 @@
 
 import argparse
 from dataclasses import dataclass
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
@@ -411,16 +412,80 @@ def ssh_environment(key):
     return environment
 
 
+def git_common_dir(checkout):
+    path = Path(run(["git", "rev-parse", "--git-common-dir"], cwd=checkout))
+    return (path if path.is_absolute() else checkout / path).resolve()
+
+
+def codex_auth_dir(common_dir):
+    """Give the container its own refreshable Codex login, never the controller home."""
+    digest = hashlib.sha256(str(common_dir).encode()).hexdigest()[:16]
+    directory = Path.home() / ".config" / "swfactory" / "codex-auth" / digest
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory.chmod(0o700)
+    target = directory / "auth.json"
+    if not target.is_file():
+        source_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        source = source_home / "auth.json"
+        if not source.is_file():
+            raise RuntimeError("Container Codex authentication requires a local file login; run codex login with file storage")
+        with tempfile.NamedTemporaryFile(dir=directory, delete=False) as temporary:
+            with source.open("rb") as original:
+                shutil.copyfileobj(original, temporary)
+            temporary_path = Path(temporary.name)
+        temporary_path.chmod(0o600)
+        os.replace(temporary_path, target)
+    return directory
+
+
+def codex_container_image():
+    path = ROOT / "env"
+    if path.is_file():
+        for line in path.read_text().splitlines():
+            name, separator, value = line.partition("=")
+            if separator and name.strip() == "CODEX_CONTAINER_IMAGE" and value.strip():
+                return value.strip().strip('"\'')
+    return "swfactory-codex:0.166.0"
+
+
+def codex_container_command(cwd, common_dir, auth_dir, result_dirs, read_only, image):
+    """Allow only the snapshot, Git metadata, results, and Codex login into Docker."""
+    uid, gid = os.getuid(), os.getgid()
+    command = ["docker", "run", "--rm", "-i", "--pull", "never",
+               "--user", "{}:{}".format(uid, gid), "--read-only", "--cap-drop", "ALL",
+               "--security-opt", "no-new-privileges", "--pids-limit", "256",
+               "--tmpfs", "/var/tmp:rw,uid={},gid={},mode=700".format(uid, gid),
+               "--mount", "type=bind,src={},dst={}{}".format(
+                   cwd, cwd, ",readonly" if read_only else ""),
+               "--mount", "type=bind,src={},dst={},readonly".format(common_dir, common_dir),
+               "--mount", "type=bind,src={},dst=/codex-home".format(auth_dir)]
+    for directory in sorted(result_dirs):
+        if directory != cwd and cwd not in directory.parents:
+            command += ["--mount", "type=bind,src={},dst={}".format(directory, directory)]
+    command += ["-e", "HOME=/var/tmp", "-e", "CODEX_HOME=/codex-home",
+                "-e", "TMPDIR=/var/tmp", "-e", "GIT_OPTIONAL_LOCKS=0",
+                "--workdir", str(cwd), image]
+    return command
+
+
 def codex(prompt, cwd, output_path=None, schema_path=None, read_only=False):
-    command = ["codex", "exec", "--ephemeral", "--sandbox",
-               "read-only" if read_only else "workspace-write", "-c", "approval_policy=never",
-               "--cd", str(cwd)]
+    cwd = Path(cwd).resolve()
+    common_dir = git_common_dir(cwd)
+    auth_dir = codex_auth_dir(common_dir)
+    result_dirs = {Path(path).resolve().parent for path in (output_path, schema_path) if path}
+    command = codex_container_command(cwd, common_dir, auth_dir, result_dirs,
+                                      read_only, codex_container_image())
+    command += ["codex", "exec", "--ephemeral", "--ignore-user-config", "--sandbox",
+                "read-only" if read_only else "danger-full-access", "-c", "approval_policy=never",
+                "--cd", str(cwd)]
     if schema_path:
-        command += ["--output-schema", str(schema_path)]
+        command += ["--output-schema", str(Path(schema_path).resolve())]
     if output_path:
-        command += ["--output-last-message", str(output_path)]
+        command += ["--output-last-message", str(Path(output_path).resolve())]
     command.append("-")
-    run(command, cwd=cwd, input_text=prompt, capture=False)
+    host_env = {name: os.environ[name] for name in
+                ("PATH", "HOME", "DOCKER_HOST", "DOCKER_CONTEXT") if name in os.environ}
+    run(command, cwd=cwd, env=host_env, input_text=prompt, capture=False)
 
 
 def format_plan(plan):
@@ -807,7 +872,7 @@ def pending_rephrase_issues(repo):
                     & issue_labels(issue))), key=lambda issue: issue["number"])
 
 
-def rephrase_issue(repo, checkout, work_dir, owner, issue):
+def rephrase_issue(repo, remote, key, checkout, work_dir, owner, issue):
     number = issue["number"]
     latest = json.loads(gh(repo, "issue", "view", str(number), "--json", "number,title,body,labels"))
     if issue_labels(latest) & {"rephased", "done", "swfactory:subtask", "swfactory:running",
@@ -837,7 +902,8 @@ def rephrase_issue(repo, checkout, work_dir, owner, issue):
                       "Issue #{}: {}\n\nOriginal body:\n{}\n\n"
                       "Existing issue comments:\n{}".format(
                           number, latest["title"], original, discussion[-30000:]))
-            codex(prompt, checkout, output_path, schema_path, read_only=True)
+            with repository_snapshot(repo, remote, key, checkout, work_dir) as (_, snapshot):
+                codex(prompt, snapshot, output_path, schema_path, read_only=True)
             result = json.loads(output_path.read_text())
         if any(not result[field].strip() for field in ("what", "why", "implementation", "tests")):
             raise RuntimeError("Rephrased issue is missing required sections")
@@ -921,28 +987,35 @@ def scan_repository(repo, checkout, work_dir):
         keys.add(key)
 
 
-def scan_latest_repository(repo, remote, key, checkout, work_dir, *, if_changed=False):
-    """Scan a detached snapshot of the remote default branch, leaving checkout untouched."""
+@contextmanager
+def repository_snapshot(repo, remote, key, checkout, work_dir):
+    """Yield a credential-free worktree at the current remote default commit."""
     branch = default_branch(repo)
     run(["git", "fetch", remote, branch], cwd=checkout, env=ssh_environment(key))
     commit = run(["git", "rev-parse", "FETCH_HEAD"], cwd=checkout)
-    digest = hashlib.sha256("{}:{}".format(repo.casefold(), checkout.resolve()).encode()).hexdigest()[:16]
-    state_path = work_dir / ".swfactory-scan-{}.json".format(digest)
-    if if_changed and state_path.exists():
-        try:
-            state = json.loads(state_path.read_text())
-            if state.get("commit") == commit and state.get("policy_version") == SCAN_POLICY_VERSION:
-                print("Scan skipped: default branch has not changed", flush=True)
-                return False
-        except (OSError, ValueError, KeyError, TypeError):
-            pass
-    with tempfile.TemporaryDirectory(prefix="swfactory-scan-worktree-", dir=work_dir) as directory:
+    with tempfile.TemporaryDirectory(prefix="swfactory-snapshot-", dir=work_dir) as directory:
         snapshot = Path(directory)
         run(["git", "worktree", "add", "--detach", str(snapshot), commit], cwd=checkout)
         try:
-            scan_repository(repo, snapshot, work_dir)
+            yield commit, snapshot
         finally:
             run(["git", "worktree", "remove", "--force", str(snapshot)], cwd=checkout)
+
+
+def scan_latest_repository(repo, remote, key, checkout, work_dir, *, if_changed=False):
+    """Scan the remote default commit, leaving the checkout untouched."""
+    digest = hashlib.sha256("{}:{}".format(repo.casefold(), checkout.resolve()).encode()).hexdigest()[:16]
+    state_path = work_dir / ".swfactory-scan-{}.json".format(digest)
+    with repository_snapshot(repo, remote, key, checkout, work_dir) as (commit, snapshot):
+        if if_changed and state_path.exists():
+            try:
+                state = json.loads(state_path.read_text())
+                if state.get("commit") == commit and state.get("policy_version") == SCAN_POLICY_VERSION:
+                    print("Scan skipped: default branch has not changed", flush=True)
+                    return False
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+        scan_repository(repo, snapshot, work_dir)
     with tempfile.NamedTemporaryFile(mode="w", prefix=state_path.name + ".",
                                      dir=work_dir, delete=False) as temporary:
         json.dump({"commit": commit, "policy_version": SCAN_POLICY_VERSION}, temporary)
@@ -1188,7 +1261,7 @@ def main():
             resume_answered_issues(repo, owner, bot)
             for issue in pending_rephrase_issues(repo):
                 try:
-                    rephrase_issue(repo, checkout, work_dir, owner, issue)
+                    rephrase_issue(repo, remote, key, checkout, work_dir, owner, issue)
                 except Exception as error:
                     print("Rephase for issue #{} failed: {}".format(issue["number"], error),
                           file=sys.stderr)

@@ -723,6 +723,69 @@ class ScanTests(unittest.TestCase):
             self.assertEqual(list(work.glob(".swfactory-scan-*.json")), [])
 
 
+class IsolationTests(unittest.TestCase):
+    def test_codex_auth_is_copied_into_dedicated_directory_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_home = root / "source"
+            source_home.mkdir()
+            (source_home / "auth.json").write_text("CODEX-CANARY")
+            (source_home / "config.toml").write_text("MCP_SECRET=do-not-copy")
+            with patch("swfactory.Path.home", return_value=root), patch.dict(
+                    os.environ, {"CODEX_HOME": str(source_home)}):
+                selected = swfactory.codex_auth_dir(root / "git")
+                self.assertEqual((selected / "auth.json").read_text(), "CODEX-CANARY")
+                self.assertEqual(sorted(path.name for path in selected.iterdir()), ["auth.json"])
+                self.assertEqual(selected.stat().st_mode & 0o777, 0o700)
+                self.assertEqual((selected / "auth.json").stat().st_mode & 0o777, 0o600)
+                (selected / "auth.json").write_text("REFRESHED")
+                self.assertEqual(swfactory.codex_auth_dir(root / "git"), selected)
+                self.assertEqual((selected / "auth.json").read_text(), "REFRESHED")
+
+    @patch("swfactory.run")
+    @patch("swfactory.codex_container_image", return_value="test-image")
+    @patch("swfactory.codex_auth_dir", return_value=Path("/isolated/auth"))
+    @patch("swfactory.git_common_dir", return_value=Path("/isolated/git"))
+    def test_codex_uses_allowlisted_host_environment_and_mounts(
+            self, _git, _auth, _image, run):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            result = root / "result" / "out.json"
+            result.parent.mkdir()
+            with patch.dict(os.environ, {"GH_TOKEN": "canary", "GITHUB_TOKEN": "canary",
+                                         "GIT_SSH_COMMAND": "canary", "SSH_AUTH_SOCK": "canary",
+                                         "GH_CONFIG_DIR": "/secret/gh"}):
+                swfactory.codex("Test prompt", root, result, read_only=True)
+            args = run.call_args.args[0]
+            child_env = run.call_args.kwargs["env"]
+            self.assertEqual(args[0:2], ["docker", "run"])
+            self.assertIn("--ignore-user-config", args)
+            self.assertIn("read-only", args)
+            self.assertIn("type=bind,src={},dst={},readonly".format(root, root), args)
+            self.assertIn("type=bind,src=/isolated/git,dst=/isolated/git,readonly", args)
+            self.assertIn("type=bind,src=/isolated/auth,dst=/codex-home", args)
+            self.assertNotIn("GH_TOKEN", child_env)
+            self.assertNotIn("GITHUB_TOKEN", child_env)
+            self.assertNotIn("GIT_SSH_COMMAND", child_env)
+            self.assertNotIn("SSH_AUTH_SOCK", child_env)
+            self.assertNotIn("GH_CONFIG_DIR", child_env)
+            self.assertNotIn("canary", " ".join(args))
+
+    @patch("swfactory.run")
+    @patch("swfactory.codex_container_image", return_value="test-image")
+    @patch("swfactory.codex_auth_dir", return_value=Path("/isolated/auth"))
+    @patch("swfactory.git_common_dir", return_value=Path("/isolated/git"))
+    def test_writable_codex_keeps_docker_boundary(self, _git, _auth, _image, run):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            swfactory.codex("Implement", root)
+            command = run.call_args.args[0]
+            self.assertIn("danger-full-access", command)
+            self.assertIn("type=bind,src={},dst={}".format(root, root), command)
+            self.assertNotIn("--privileged", command)
+            self.assertIn("--cap-drop", command)
+            self.assertIn("type=bind,src=/isolated/git,dst=/isolated/git,readonly", command)
+
 class QuestionTests(unittest.TestCase):
     @patch("swfactory.gh")
     def test_question_mentions_owner_and_pauses_issue(self, gh):
@@ -806,10 +869,11 @@ class RephraseTests(unittest.TestCase):
         self.assertTrue(body.endswith("==== original ====\n\nOriginal\ncontent"))
         self.assertIn("https://example.com", body)
 
+    @patch("swfactory.repository_snapshot")
     @patch("swfactory.owner_comments", return_value=[])
     @patch("swfactory.codex")
     @patch("swfactory.gh")
-    def test_rephrase_rewrites_body_and_marks_completed(self, gh, codex, _comments):
+    def test_rephrase_rewrites_body_and_marks_completed(self, gh, codex, _comments, snapshot):
         source = issue(3)
         source["body"] = "Original text"
         rewritten_bodies = []
@@ -823,15 +887,18 @@ class RephraseTests(unittest.TestCase):
 
         gh.side_effect = github_call
 
-        def write_result(_prompt, _checkout, output_path, _schema_path, read_only):
+        def write_result(_prompt, selected_checkout, output_path, _schema_path, read_only):
             self.assertTrue(read_only)
+            self.assertEqual(selected_checkout, snapshot.return_value.__enter__.return_value[1])
             output_path.write_text(json.dumps({"what": "Feature", "why": "Reason",
                                                "implementation": "Steps", "tests": "Test",
                                                "references": ["https://example.com"], "questions": []}))
 
         codex.side_effect = write_result
         with tempfile.TemporaryDirectory() as directory:
-            swfactory.rephrase_issue("owner/repo", Path(directory), Path(directory), "owner", source)
+            snapshot.return_value.__enter__.return_value = ("commit", Path(directory))
+            swfactory.rephrase_issue("owner/repo", "remote", Path("key"),
+                                     Path(directory), Path(directory), "owner", source)
         calls = [call.args for call in gh.call_args_list]
         self.assertTrue(rewritten_bodies[0].endswith("==== original ====\n\nOriginal text"))
         self.assertIn(("owner/repo", "issue", "edit", "3", "--add-label", "rephased"), calls)
