@@ -14,3 +14,4 @@ The work number is the implementation PR number. GitHub issue numbers identify r
 | 28 | [Isolate Codex execution in Docker](https://github.com/charsyam/swfactory/pull/28) | [#15](https://github.com/charsyam/swfactory/issues/15), [#26](https://github.com/charsyam/swfactory/issues/26) | Merged |
 | 29 | [Verify the Codex credential boundary](https://github.com/charsyam/swfactory/pull/29) | [#15](https://github.com/charsyam/swfactory/issues/15), [#27](https://github.com/charsyam/swfactory/issues/27) | Merged |
 | 31 | [Fix scan inspection inside Docker](https://github.com/charsyam/swfactory/pull/31) | [#30](https://github.com/charsyam/swfactory/issues/30) | Implemented; review pending |
+| 51 | [Allow executable temporary test fixtures in Codex container](https://github.com/charsyam/swfactory/pull/51) | [#50](https://github.com/charsyam/swfactory/issues/50), blocked #32 and #33 | Implemented; review pending |
