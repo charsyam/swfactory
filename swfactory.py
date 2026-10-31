@@ -240,6 +240,18 @@ def check_offline_environment(configuration):
     return tuple(findings)
 
 
+def doctor(repository_override=None, project_override=None):
+    """Report every local prerequisite without starting a normal run."""
+    configuration = validate_configuration(repository_override, project_override)
+    findings = tuple(OfflineFinding("CONFIG/" + finding.name, "FAIL", finding.message)
+                     for finding in configuration.findings)
+    findings += check_offline_environment(configuration)
+    for finding in findings:
+        action = "None ({})".format(finding.action) if finding.status == "PASS" else finding.action
+        print("{}: {} — Next action: {}".format(finding.name, finding.status, action))
+    return 0 if all(finding.status == "PASS" for finding in findings) else 1
+
+
 def read_env_values(path):
     """Parse env without exposing its contents in errors or output."""
     values = {}
@@ -1073,6 +1085,7 @@ def process_issue(repo, remote, key, checkout, work_dir, owner, issue):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", nargs="?", choices=("doctor",), help="Run offline local checks")
     parser.add_argument("--login", action="store_true", help="Log in to this repository's isolated gh profile")
     parser.add_argument("--repository", help="Target GitHub SSH URL; defaults to env GITHUB_REPOGITORY")
     parser.add_argument("--project-path", help="Local target Git root; defaults to env PROJECT_PATH")
@@ -1080,6 +1093,8 @@ def main():
     parser.add_argument("--scan", action="store_true", help="Propose bug/refactor issues from current code")
     parser.add_argument("--interval", type=int, default=60, help="Polling interval in seconds")
     args = parser.parse_args()
+    if args.command == "doctor":
+        return doctor(args.repository, args.project_path)
     if args.interval < 1:
         parser.error("--interval must be positive")
     repo, remote, key, checkout, work_dir = config(args.repository, args.project_path)
@@ -1126,4 +1141,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
