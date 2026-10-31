@@ -9,6 +9,7 @@
  4) alternative ways.
 
 4. when you implement something, should recode it work-items.md with work number and write the detail sequence and idea into docs/{work number}.md
+5. use the GitHub issue number as the work number. For a split task, use its sub-issue number. Record the implementation PR as a separate linked number; GitHub issue and PR numbers are not interchangeable.
 
 ### PROJECT
 

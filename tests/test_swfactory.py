@@ -80,6 +80,24 @@ class PlanTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "changed test file"):
                 swfactory.validate_verification(result, worktree, 1)
 
+    def test_issue_numbered_work_records_follow_subissue_numbers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            (worktree / "AGENTS.md").write_text(
+                "Record work-items.md and docs/{work number}.md for each change.\n")
+            (worktree / "work-items.md").write_text("| 14 | First task |\n| 15 | Second task |\n")
+            (worktree / "docs").mkdir()
+            (worktree / "docs/14.md").write_text("First task\n")
+            (worktree / "docs/15.md").write_text("Second task\n")
+            swfactory.validate_issue_numbered_records(worktree, [14, 15])
+            (worktree / "docs/15.md").unlink()
+            with self.assertRaisesRegex(RuntimeError, "Missing docs/15.md"):
+                swfactory.validate_issue_numbered_records(worktree, [14, 15])
+            (worktree / "docs/15.md").write_text("Second task\n")
+            (worktree / "work-items.md").write_text("| 14 | First task |\n")
+            with self.assertRaisesRegex(RuntimeError, "Missing work-items.md row"):
+                swfactory.validate_issue_numbered_records(worktree, [14, 15])
+
     @patch("swfactory.run")
     def test_repo_view_passes_repository_as_argument(self, run):
         run.return_value = '{"defaultBranchRef":{"name":"main"}}'
