@@ -22,6 +22,15 @@ Run `python3 swfactory.py --login` once in a terminal for each target repository
 
 ## Run
 
+Run a manual, offline prerequisite check before starting the controller:
+
+```sh
+python3 swfactory.py doctor
+python3 swfactory.py doctor --repository git@github.com:OWNER/ANOTHER-PROJECT.git --project-path /path/to/ANOTHER-PROJECT
+```
+
+Doctor prints configuration findings followed by Python, executable, SSH key, checkout root, origin, and work directory checks in a stable order. Each line shows PASS, FAIL, or UNKNOWN and an action or explanation. It exits with status 0 only when every required check passes; any FAIL or UNKNOWN gives status 1. It reads local configuration and Git metadata without creating a work directory or GitHub profile, contacting GitHub, or running Codex. PASS confirms local prerequisites only. It does not verify GitHub authentication, remote access, SSH push permission, or a successful `codex exec` run. `--repository` and `--project-path` override the corresponding `env` settings for this command too.
+
 ```sh
 python3 swfactory.py                # process current accepted issues once
 python3 swfactory.py --watch        # poll every 60 seconds

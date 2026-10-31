@@ -1,8 +1,12 @@
 import json
+import contextlib
+import io
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -464,6 +468,134 @@ class OfflineCheckTests(unittest.TestCase):
             self.assertEqual(self.statuses(findings)["PROJECT_ROOT"], "UNKNOWN")
             self.assertEqual(self.statuses(findings)["ORIGIN"], "UNKNOWN")
             self.assertEqual(self.statuses(findings)["WORK_DIR"], "UNKNOWN")
+
+
+class DoctorCommandTests(unittest.TestCase):
+    def fixture(self, root):
+        script = root / "swfactory.py"
+        shutil.copyfile(swfactory.__file__, script)
+        key = root / "key"
+        key.write_text("secret-key-sentinel")
+        project = root / "project"
+        project.mkdir()
+        swfactory.run(["git", "init"], cwd=project)
+        swfactory.run(["git", "remote", "add", "origin", "git@github.com:owner/repo.git"], cwd=project)
+        work = root / "new-work"
+        (root / "env").write_text(
+            "GITHUB_REPOGITORY=git@github.com:owner/repo.git\n"
+            "GITHUB_SSH_KEY_PATH={}\nPROJECT_PATH={}\nWORK_DIR={}\n".format(key, project, work))
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        real_git = shutil.which("git")
+        for name in ("git", "ssh", "gh", "codex"):
+            target = bin_dir / name
+            target.write_text("#!/bin/sh\nprintf '%s\\n' \"{} $*\" >> \"$DOCTOR_COMMAND_LOG\"\n{}\n".format(
+                name, "exec \"{}\" \"$@\"".format(real_git) if name == "git" else "exit 99"))
+            target.chmod(0o755)
+        home = root / "home"
+        home.mkdir()
+        environment = os.environ.copy()
+        environment.update({"PATH": str(bin_dir) + os.pathsep + environment.get("PATH", ""),
+                            "HOME": str(home), "DOCTOR_COMMAND_LOG": str(root / "commands.log")})
+        return script, project, work, home, environment
+
+    def execute(self, script, environment, *args):
+        return subprocess.run([sys.executable, str(script), *args], cwd=script.parent,
+                              env=environment, text=True, capture_output=True)
+
+    def test_help_displays_doctor_and_overrides(self):
+        completed = subprocess.run([sys.executable, str(Path(swfactory.__file__)), "--help"],
+                                   text=True, capture_output=True)
+        self.assertEqual(completed.returncode, 0)
+        for option in ("doctor", "--repository", "--project-path"):
+            self.assertIn(option, completed.stdout)
+
+    def test_exit_policy_includes_fail_and_unknown(self):
+        selected = swfactory.ConfigurationResult(
+            swfactory.Configuration("owner/repo", "remote", None, None, None), ())
+        for status, expected in (("PASS", 0), ("FAIL", 1), ("UNKNOWN", 1)):
+            with self.subTest(status=status), patch("swfactory.validate_configuration",
+                    return_value=selected), patch("swfactory.check_offline_environment",
+                    return_value=(swfactory.OfflineFinding("check", status, "Take action"),)):
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(swfactory.doctor(), expected)
+                self.assertIn("check: {} — Next action: ".format(status), output.getvalue())
+
+    def test_main_dispatches_before_normal_run(self):
+        with patch.object(sys, "argv", ["swfactory.py", "doctor", "--interval", "0",
+                                        "--repository", "git@github.com:owner/repo.git",
+                                        "--project-path", "/selected/project"]), \
+                patch("swfactory.doctor", return_value=1) as doctor, \
+                patch("swfactory.config", side_effect=AssertionError("normal run started")), \
+                patch("swfactory.isolate_github_auth", side_effect=AssertionError("auth started")), \
+                patch("swfactory.verify_github_access", side_effect=AssertionError("probe started")), \
+                patch("swfactory.ensure_labels", side_effect=AssertionError("labels started")), \
+                patch("swfactory.scan_repository", side_effect=AssertionError("scan started")), \
+                patch("swfactory.pending_rephrase_issues", side_effect=AssertionError("rephrase started")), \
+                patch("swfactory.pending_issues", side_effect=AssertionError("issues started")):
+            self.assertEqual(swfactory.main(), 1)
+        doctor.assert_called_once_with("git@github.com:owner/repo.git", "/selected/project")
+
+    def test_subprocess_success_is_ordered_and_has_no_side_effects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script, project, work, home, environment = self.fixture(root)
+            completed = self.execute(script, environment, "doctor")
+            self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+            self.assertEqual([line.split(":", 1)[0] for line in completed.stdout.splitlines()],
+                             ["python", "git", "ssh", "gh", "codex", "SSH_KEY",
+                              "PROJECT_ROOT", "ORIGIN", "WORK_DIR"])
+            self.assertTrue(all(": PASS — Next action: None" in line
+                                for line in completed.stdout.splitlines()))
+            self.assertEqual(completed.stderr, "")
+            self.assertEqual((root / "commands.log").read_text().splitlines(),
+                             ["git rev-parse --show-toplevel", "git remote get-url origin",
+                              "git rev-parse --show-toplevel", "git remote get-url origin"])
+            self.assertFalse(work.exists())
+            self.assertFalse((home / ".config" / "swfactory").exists())
+            self.assertTrue(project.exists())
+
+    def test_subprocess_reports_multiple_errors_and_redacts_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script, project, work, home, environment = self.fixture(root)
+            (root / "env").write_text(
+                "GITHUB_REPOGITORY=secret-remote-sentinel\n"
+                "GITHUB_SSH_KEY_PATH=secret-key-path-sentinel\n"
+                "PROJECT_PATH=secret-project-path-sentinel\nWORK_DIR={}\n".format(work))
+            completed = self.execute(script, environment, "doctor")
+            self.assertEqual(completed.returncode, 1)
+            lines = completed.stdout.splitlines()
+            self.assertEqual([line.split(":", 1)[0] for line in lines],
+                             ["CONFIG/GITHUB_REPOGITORY", "CONFIG/GITHUB_SSH_KEY_PATH",
+                              "CONFIG/PROJECT_PATH", "python", "git", "ssh", "gh", "codex",
+                              "SSH_KEY", "PROJECT_ROOT", "ORIGIN", "WORK_DIR"])
+            self.assertEqual([line.split(": ", 1)[1].split(" — ", 1)[0] for line in lines],
+                             ["FAIL"] * 3 + ["PASS"] * 5 + ["FAIL"] + ["UNKNOWN"] * 3)
+            self.assertTrue(all(" — Next action: " in line for line in lines))
+            self.assertIn("Set PROJECT_PATH to an existing checkout", completed.stdout)
+            self.assertIn("Provide a Git checkout to inspect origin", completed.stdout)
+            self.assertIn("Set GITHUB_SSH_KEY_PATH to a readable regular file", completed.stdout)
+            for secret in ("secret-remote-sentinel", "secret-key-path-sentinel",
+                           "secret-project-path-sentinel", "secret-key-sentinel"):
+                self.assertNotIn(secret, completed.stdout + completed.stderr)
+            self.assertFalse(work.exists())
+            self.assertFalse((home / ".config" / "swfactory").exists())
+            self.assertFalse((root / "commands.log").exists())
+
+    def test_subprocess_overrides_take_precedence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script, project, work, _, environment = self.fixture(root)
+            env_path = root / "env"
+            env_path.write_text(env_path.read_text().replace(
+                "git@github.com:owner/repo.git", "secret-bad-repository").replace(
+                str(project), "secret-bad-project"))
+            completed = self.execute(script, environment, "doctor", "--repository",
+                                     "git@github.com:OWNER/REPO.git", "--project-path", str(project))
+            self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+            self.assertNotIn("secret-bad", completed.stdout + completed.stderr)
+            self.assertFalse(work.exists())
 
 class ScanTests(unittest.TestCase):
     @patch("swfactory.gh")
