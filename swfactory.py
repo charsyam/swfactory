@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -141,6 +142,102 @@ class ConfigurationFinding:
 class ConfigurationResult:
     values: Configuration
     findings: Tuple[ConfigurationFinding, ...]
+
+
+@dataclass(frozen=True)
+class OfflineFinding:
+    name: str
+    status: str
+    action: str
+
+
+MIN_PYTHON_VERSION = (3, 7)
+
+
+def check_offline_environment(configuration):
+    """Check local prerequisites only, without creating files or contacting a remote."""
+    selected = configuration.values
+    findings = []
+    if sys.version_info[:2] >= MIN_PYTHON_VERSION:
+        findings.append(OfflineFinding("python", "PASS", "Python is available"))
+    else:
+        findings.append(OfflineFinding("python", "FAIL", "Use Python 3.7 or newer"))
+
+    available = {}
+    for tool in ("git", "ssh", "gh", "codex"):
+        available[tool] = shutil.which(tool) is not None
+        findings.append(OfflineFinding(
+            tool, "PASS" if available[tool] else "FAIL",
+            "Executable is available" if available[tool] else "Install {} and add it to PATH".format(tool)))
+
+    key = selected.key
+    try:
+        key_readable = key is not None and key.is_file() and os.access(key, os.R_OK)
+    except (OSError, ValueError):
+        key_readable = False
+    findings.append(OfflineFinding(
+        "SSH_KEY", "PASS" if key_readable else "FAIL",
+        "SSH key is a readable regular file" if key_readable else
+        "Set GITHUB_SSH_KEY_PATH to a readable regular file"))
+
+    project = selected.project
+    try:
+        project_ready = project is not None and project.is_dir()
+    except (OSError, ValueError):
+        project_ready = False
+    checkout_root = None
+    if not project_ready:
+        findings.append(OfflineFinding("PROJECT_ROOT", "UNKNOWN", "Set PROJECT_PATH to an existing checkout"))
+    elif not available["git"]:
+        findings.append(OfflineFinding("PROJECT_ROOT", "UNKNOWN", "Install git to inspect PROJECT_PATH"))
+    else:
+        try:
+            detected_root = Path(run(["git", "rev-parse", "--show-toplevel"], cwd=project)).resolve()
+            project_root = project.resolve()
+        except (OSError, RuntimeError, ValueError):
+            findings.append(OfflineFinding("PROJECT_ROOT", "FAIL", "Set PROJECT_PATH to a Git repository root"))
+        else:
+            checkout_root = detected_root
+            findings.append(OfflineFinding(
+                "PROJECT_ROOT", "PASS" if checkout_root == project_root else "FAIL",
+                "PROJECT_PATH is the checkout root" if checkout_root == project_root else
+                "Set PROJECT_PATH to the checkout root"))
+
+    if checkout_root is None:
+        findings.append(OfflineFinding("ORIGIN", "UNKNOWN", "Provide a Git checkout to inspect origin"))
+    elif selected.repository is None:
+        findings.append(OfflineFinding("ORIGIN", "UNKNOWN", "Set a valid GITHUB_REPOGITORY to compare origin"))
+    else:
+        try:
+            origin = run(["git", "remote", "get-url", "origin"], cwd=project)
+        except (OSError, RuntimeError):
+            findings.append(OfflineFinding("ORIGIN", "FAIL", "Add an origin remote for the selected repository"))
+        else:
+            match = re.fullmatch(
+                r"(?:git@github\.com:|https://github\.com/)([^/]+/[^/]+?)(?:\.git)?/?", origin)
+            matches = bool(match and match.group(1).casefold() == selected.repository.casefold())
+            findings.append(OfflineFinding(
+                "ORIGIN", "PASS" if matches else "FAIL",
+                "Origin matches GITHUB_REPOGITORY" if matches else
+                "Set origin to the selected GITHUB_REPOGITORY"))
+
+    work_dir = selected.work_dir
+    if work_dir is None:
+        findings.append(OfflineFinding("WORK_DIR", "UNKNOWN", "Set WORK_DIR to a valid path"))
+    elif checkout_root is None:
+        findings.append(OfflineFinding("WORK_DIR", "UNKNOWN", "Provide a Git checkout to compare WORK_DIR"))
+    else:
+        try:
+            canonical_work_dir = work_dir.resolve()
+        except (OSError, RuntimeError, ValueError):
+            findings.append(OfflineFinding("WORK_DIR", "UNKNOWN", "Set WORK_DIR to a valid path"))
+            return tuple(findings)
+        outside = canonical_work_dir != checkout_root and checkout_root not in canonical_work_dir.parents
+        findings.append(OfflineFinding(
+            "WORK_DIR", "PASS" if outside else "FAIL",
+            "WORK_DIR is outside the checkout" if outside else
+            "Set WORK_DIR outside the checkout"))
+    return tuple(findings)
 
 
 def read_env_values(path):

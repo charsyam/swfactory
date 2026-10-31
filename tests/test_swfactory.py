@@ -326,6 +326,145 @@ class ConfigurationTests(unittest.TestCase):
             with patch.object(swfactory, "ROOT", root):
                 self.assertEqual(swfactory.validate_configuration().findings, ())
 
+
+class OfflineCheckTests(unittest.TestCase):
+    def fixture(self, root, *, origin="git@github.com:owner/repo.git"):
+        key = root / "key"
+        key.touch()
+        project = root / "project"
+        project.mkdir()
+        swfactory.run(["git", "init"], cwd=project)
+        if origin is not None:
+            swfactory.run(["git", "remote", "add", "origin", origin], cwd=project)
+        work_dir = root / "new-work"
+        return swfactory.ConfigurationResult(
+            swfactory.Configuration("owner/repo", "git@github.com:owner/repo.git",
+                                    key, project, work_dir), ())
+
+    def statuses(self, result):
+        return {finding.name: finding.status for finding in result}
+
+    def test_each_missing_executable_fails_with_remedy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.fixture(Path(directory))
+            for missing in ("git", "ssh", "gh", "codex"):
+                with self.subTest(tool=missing), patch("swfactory.shutil.which",
+                        side_effect=lambda name: None if name == missing else "/bin/" + name):
+                    results = swfactory.check_offline_environment(config)
+                    self.assertEqual(self.statuses(results)[missing], "FAIL")
+                    self.assertIn("Install " + missing, next(f.action for f in results if f.name == missing))
+                    self.assertEqual(self.statuses(results)["PROJECT_ROOT"],
+                                     "UNKNOWN" if missing == "git" else "PASS")
+
+    def test_key_must_be_readable_regular_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.fixture(Path(directory))
+            values = config.values
+            for key in (Path(directory) / "absent", Path(directory)):
+                with self.subTest(key=key):
+                    selected = swfactory.ConfigurationResult(
+                        swfactory.Configuration(values.repository, values.remote, key,
+                                                values.project, values.work_dir), ())
+                    finding = next(f for f in swfactory.check_offline_environment(selected)
+                                   if f.name == "SSH_KEY")
+                    self.assertEqual(finding.status, "FAIL")
+                    self.assertIn("readable regular file", finding.action)
+            with patch("swfactory.os.access", return_value=False):
+                finding = next(f for f in swfactory.check_offline_environment(config)
+                               if f.name == "SSH_KEY")
+                self.assertEqual(finding.status, "FAIL")
+
+    def test_python_version_floor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.fixture(Path(directory))
+            with patch("swfactory.sys.version_info", (3, 6, 15)):
+                finding = swfactory.check_offline_environment(config)[0]
+            self.assertEqual((finding.name, finding.status), ("python", "FAIL"))
+            self.assertIn("3.7", finding.action)
+
+    def test_checkout_root_origin_and_work_dir_cases(self):
+        for origin, expected_origin in (("git@github.com:owner/repo.git", "PASS"),
+                                        ("https://github.com/OWNER/REPO", "PASS"),
+                                        (None, "FAIL"),
+                                        ("git@github.com:other/repo.git", "FAIL")):
+            with self.subTest(origin=origin), tempfile.TemporaryDirectory() as directory:
+                config = self.fixture(Path(directory), origin=origin)
+                self.assertEqual(self.statuses(swfactory.check_offline_environment(config)),
+                                 {"python": "PASS", "git": "PASS", "ssh": "PASS",
+                                  "gh": "PASS", "codex": "PASS", "SSH_KEY": "PASS",
+                                  "PROJECT_ROOT": "PASS", "ORIGIN": expected_origin,
+                                  "WORK_DIR": "PASS"})
+                self.assertFalse(config.values.work_dir.exists())
+                nested = config.values.project / "nested"
+                nested.mkdir()
+                values = config.values
+                nested_config = swfactory.ConfigurationResult(swfactory.Configuration(
+                    values.repository, values.remote, values.key, nested, nested / "work"), ())
+                findings = self.statuses(swfactory.check_offline_environment(nested_config))
+                self.assertEqual(findings["PROJECT_ROOT"], "FAIL")
+                self.assertEqual(findings["WORK_DIR"], "FAIL")
+
+    def test_independent_failures_and_unknown_dependencies_use_local_commands_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self.fixture(root)
+            values = config.values
+            broken = swfactory.ConfigurationResult(swfactory.Configuration(
+                None, "secret-invalid-remote", root / "absent", values.project,
+                values.project / "work"), ())
+            real_run = swfactory.run
+            with patch("swfactory.run", wraps=real_run) as run, patch(
+                    "swfactory.shutil.which", side_effect=lambda name: None if name == "gh" else "/bin/" + name):
+                findings = swfactory.check_offline_environment(broken)
+            statuses = self.statuses(findings)
+            self.assertEqual(statuses["gh"], "FAIL")
+            self.assertEqual(statuses["SSH_KEY"], "FAIL")
+            self.assertEqual(statuses["PROJECT_ROOT"], "PASS")
+            self.assertEqual(statuses["ORIGIN"], "UNKNOWN")
+            self.assertEqual(statuses["WORK_DIR"], "FAIL")
+            self.assertEqual([call.args[0] for call in run.call_args_list],
+                             [["git", "rev-parse", "--show-toplevel"]])
+            self.assertNotIn("secret-invalid-remote", repr(findings))
+
+    def test_valid_checkout_invokes_only_two_local_git_inspections(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.fixture(Path(directory))
+            real_run = swfactory.run
+            with patch("swfactory.run", wraps=real_run) as run, \
+                    patch("swfactory.gh", side_effect=AssertionError("gh must not run")), \
+                    patch("swfactory.codex", side_effect=AssertionError("codex must not run")), \
+                    patch("swfactory.shutil.which", return_value="/usr/bin/tool"):
+                findings = swfactory.check_offline_environment(config)
+            self.assertTrue(all(f.status == "PASS" for f in findings))
+            self.assertEqual([call.args[0] for call in run.call_args_list], [
+                ["git", "rev-parse", "--show-toplevel"],
+                ["git", "remote", "get-url", "origin"],
+            ])
+            self.assertFalse(config.values.work_dir.exists())
+
+    def test_missing_checkout_or_git_keeps_dependent_checks_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.fixture(Path(directory))
+            values = config.values
+            missing_project = swfactory.ConfigurationResult(swfactory.Configuration(
+                values.repository, values.remote, values.key, None, values.work_dir), ())
+            with patch("swfactory.run") as run:
+                findings = swfactory.check_offline_environment(missing_project)
+            run.assert_not_called()
+            self.assertEqual(self.statuses(findings)["PROJECT_ROOT"], "UNKNOWN")
+            self.assertEqual(self.statuses(findings)["ORIGIN"], "UNKNOWN")
+            self.assertEqual(self.statuses(findings)["WORK_DIR"], "UNKNOWN")
+            with patch("swfactory.shutil.which",
+                       side_effect=lambda name: None if name == "git" else "/bin/" + name), \
+                    patch("swfactory.run") as run:
+                findings = swfactory.check_offline_environment(config)
+            run.assert_not_called()
+            self.assertEqual(self.statuses(findings)["git"], "FAIL")
+            self.assertEqual(self.statuses(findings)["SSH_KEY"], "PASS")
+            self.assertEqual(self.statuses(findings)["PROJECT_ROOT"], "UNKNOWN")
+            self.assertEqual(self.statuses(findings)["ORIGIN"], "UNKNOWN")
+            self.assertEqual(self.statuses(findings)["WORK_DIR"], "UNKNOWN")
+
 class ScanTests(unittest.TestCase):
     @patch("swfactory.gh")
     @patch("swfactory.codex")
