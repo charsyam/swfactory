@@ -6,6 +6,14 @@
 
 Requirements: Python 3, Git, SSH, `gh`, and an authenticated `codex` CLI. The Codex CLI is used through the console; no OpenAI API key is read by this program. GitHub API access needs a repository-specific `gh` login, set up below.
 
+Codex runs inside a local Docker container so repository content and tests cannot read the controller's GitHub CLI settings or SSH key. Build the default image once on macOS or Linux with Docker running:
+
+```sh
+docker build -f docker/Codex.Dockerfile -t swfactory-codex:0.166.0 .
+```
+
+The image includes Codex CLI 0.166.0, Python, Git, and ripgrep. For another project's test dependencies, build an image with those tools and set `CODEX_CONTAINER_IMAGE` in `env`. Docker is required for every Codex call; if it or the selected image is unavailable, work stops without falling back to a host Codex process. The local Codex login must have a file-backed `auth.json` under `CODEX_HOME` (default `~/.codex`). On first use swfactory copies only that file to a private per-target Codex home, where token refreshes persist. [Official Codex authentication guidance](https://learn.chatgpt.com/docs/auth?surface=cli) describes file-backed login and its credential handling.
+
 Create an untracked `env` file next to `swfactory.py`:
 
 ```text
@@ -14,6 +22,7 @@ GITHUB_REPOGITORY=git@github.com:OWNER/TARGET-PROJECT.git
 PROJECT_PATH=/absolute/path/to/TARGET-PROJECT
 WORK_DIR=/absolute/path/for/issue-worktrees
 OWNER_GITHUB_HANDLE=YOUR-GITHUB-USERNAME
+CODEX_CONTAINER_IMAGE=swfactory-codex:0.166.0
 ```
 
 Clone the target project once yourself, then set `PROJECT_PATH` to that checkout. `GITHUB_REPOGITORY` and `PROJECT_PATH` name the **target project**, not the `swfactory` source repository. `PROJECT_PATH` must be the root of an existing local Git checkout whose `origin` points to the same GitHub repository. `WORK_DIR` holds temporary worktrees and run files; it defaults to `/tmp` when omitted and must be outside `PROJECT_PATH`. `OWNER_GITHUB_HANDLE` is the GitHub username to mention for questions; if omitted, the repository owner's login is used. For organization-owned repositories, set it explicitly to a person. The SSH key is used for Git fetch and push. GitHub's issue, label, comment, and PR APIs require a separate authenticated `gh` account. Apply `accept` only to issues you authorize the local agent to implement.
@@ -41,6 +50,8 @@ python3 swfactory.py --project-path /path/to/ANOTHER-PROJECT --repository git@gi
 ```
 
 The tool uses the existing local target checkout and creates temporary Git worktrees under `WORK_DIR`. `--repository` and `--project-path` override the target settings from `env` for one run. The `swfactory` source checkout is never used as the target workspace unless explicitly configured as the target. `--scan` fetches and inspects a detached snapshot of the target's latest default branch. `--scan-if-changed` does the same only when the remote commit or scan policy differs from the last successful scan, recorded under `WORK_DIR`; it is intended for scheduled use. Scanned findings require a source path, code identifier, and verbatim evidence. The tool checks both open and closed issues for a stable finding key and matching titles before posting, so reworded proposals for the same code location do not recur. It does not add `accept`; review each proposal and apply that label yourself. The key groups findings by kind, path, and identifier, so distinct findings in the same function and category should be reviewed within one issue.
+
+Each Codex call receives only a temporary worktree, read-only Git metadata, a result directory when needed, and its dedicated Codex login. Rephrasing and scanning use detached snapshots, so untracked files in your `PROJECT_PATH` checkout (such as `env`) are never mounted for Codex. Read-only operations have a read-only Docker workspace and Codex read-only mode. Writable operations let Codex edit the mounted worktree inside the Docker boundary; Codex's inner sandbox uses `danger-full-access` because nested workspace-write rejected file writes during testing. This mode does not grant access to host paths that were not mounted, and the Docker socket is not mounted. The Codex login remains readable inside the container; treat that login as a credential and use a dedicated account if it must also be hidden from generated code.
 
 ## Rewrite an initial issue
 
