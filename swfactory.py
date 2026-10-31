@@ -373,11 +373,14 @@ def validate_verification(result, worktree, expected_tasks):
     if {case["task"] for case in cases} != required:
         raise RuntimeError("Every task in this PR must add a reported test case")
     for case in cases:
+        reported_name = case["case"].strip().strip("`")
+        method_name = reported_name.split("::")[-1].rsplit(".", 1)[-1].split("[", 1)[0]
         if (not all(str(case[field]).strip() for field in ("path", "case", "behavior"))
                 or case["path"] not in changed
                 or not (worktree / case["path"]).is_file()
-                or case["case"] not in (worktree / case["path"]).read_text(errors="replace")):
-            raise RuntimeError("Reported test case must be in a changed test file: " + case["path"])
+                or method_name not in (worktree / case["path"]).read_text(errors="replace")):
+            raise RuntimeError("Reported test case {} must be in a changed test file: {}".format(
+                case["case"], case["path"]))
     if {item["kind"] for item in results} != {"basic", "functional", "integration"}:
         raise RuntimeError("Basic, functional, and integration test results are required")
     if any(not item["passed"] or not item["command"].strip() or not item["output"].strip()
@@ -424,7 +427,7 @@ def write_pr_work_item(worktree, pr_url, parent_number, subtasks, title, plan, t
     return True
 
 
-def existing_task_pr(repo, branch, expected_base, child_number, task_title):
+def existing_task_pr(repo, branch, expected_base, child_number):
     items = json.loads(gh(repo, "pr", "list", "--state", "all", "--head", branch,
                           "--limit", "100", "--json", "url,state,baseRefName,title"))
     if not items:
@@ -432,19 +435,68 @@ def existing_task_pr(repo, branch, expected_base, child_number, task_title):
     if len(items) != 1:
         raise RuntimeError("Multiple PRs found for task branch " + branch)
     item = items[0]
-    expected_title = "Sub-issue #{}: {}".format(child_number, task_title[:180])
+    expected_title_prefix = "Sub-issue #{}: ".format(child_number)
     if (item["state"] != "OPEN" or item["baseRefName"] != expected_base
-            or item["title"] != expected_title):
-        raise RuntimeError("Existing task PR does not match the current plan: " + item["url"])
+            or not item["title"].startswith(expected_title_prefix)):
+        raise RuntimeError("Existing task PR does not match its sub-issue or base: " + item["url"])
     return item["url"]
 
 
-def close_completed_subtask(repo, child_number, parent_number, pr_url):
-    child = json.loads(gh(repo, "issue", "view", str(child_number), "--json", "state"))
-    if child["state"] == "OPEN":
-        gh(repo, "issue", "close", str(child_number), "--reason", "completed",
-           "--comment", "Implemented and tested in {} (parent #{}).".format(
-               pr_url, parent_number))
+def record_completed_subtask(repo, child_number, parent_number, pr_url):
+    """Mark implementation ready while leaving issue closure to merge reconciliation."""
+    child = json.loads(gh(repo, "issue", "view", str(child_number), "--json", "labels"))
+    if "done" in issue_labels(child):
+        return
+    gh(repo, "issue", "edit", str(child_number), "--add-label", "done")
+    gh(repo, "issue", "comment", str(child_number), "--body",
+       "Implemented and tested in {} (parent #{}). This issue closes after that PR is merged.".format(
+           pr_url, parent_number))
+
+
+def parent_subtask_numbers(body):
+    start = body.find(SUBTASK_LINKS_START)
+    end = body.find(SUBTASK_LINKS_END, start + len(SUBTASK_LINKS_START)) if start >= 0 else -1
+    if start < 0 or end < 0:
+        return []
+    section = body[start + len(SUBTASK_LINKS_START):end]
+    matches = re.findall(r"(?m)^- \[#(\d+)\]\(https://github\.com/[^)]+/issues/(\d+)\)", section)
+    return [int(number) for number, url_number in matches if number == url_number]
+
+
+def reconcile_merged_issues(repo, owner):
+    """Close accepted work only after every associated task PR is merged."""
+    issues = json.loads(gh(repo, "issue", "list", "--state", "open", "--label", "done",
+                           "--limit", "1000", "--json", "number,body,labels"))
+    for parent in issues:
+        number = parent["number"]
+        children = parent_subtask_numbers(parent.get("body") or "")
+        if not children or "accept" not in issue_labels(parent):
+            continue
+        if not owner_applied_label(repo, parent, "accept", owner):
+            continue
+        merged_urls = []
+        all_merged = True
+        for index, child_number in enumerate(children, 1):
+            branch = "swfactory/issue-{}-task-{}".format(number, index)
+            matches = json.loads(gh(repo, "pr", "list", "--state", "all", "--head", branch,
+                                    "--limit", "100", "--json", "url,state,title,headRefName"))
+            matches = [item for item in matches if item.get("headRefName") == branch
+                       and item.get("title", "").startswith("Sub-issue #{}: ".format(child_number))]
+            if len(matches) != 1 or matches[0]["state"] != "MERGED":
+                all_merged = False
+                continue
+            pr_url = matches[0]["url"]
+            merged_urls.append(pr_url)
+            child = json.loads(gh(repo, "issue", "view", str(child_number), "--json", "state,labels"))
+            if child["state"] == "OPEN":
+                if "swfactory:subtask" not in issue_labels(child):
+                    all_merged = False
+                    continue
+                gh(repo, "issue", "close", str(child_number), "--reason", "completed",
+                   "--comment", "Merged in {} (parent #{}).".format(pr_url, number))
+        if all_merged:
+            gh(repo, "issue", "close", str(number), "--reason", "completed",
+               "--comment", "All task PRs have been merged: {}".format(", ".join(merged_urls)))
 
 
 def format_test_report(result):
@@ -458,6 +510,13 @@ def format_test_report(result):
             item["kind"], item["command"], item["output"]))
     lines += ["", result["details"]]
     return "\n".join(lines)
+
+
+def local_integration_checks(checks):
+    """Leave PR-state checks to the controller, which owns GitHub credentials."""
+    return [check for check in checks if not re.search(
+        r"\bgh\s+pr\b|\bPR\s*#\d+\b.*\b(state|head|base|metadata)\b|GitHub API.*\bPR\b",
+        check, re.IGNORECASE)]
 
 
 def issue_comments(repo, number):
@@ -682,7 +741,10 @@ def process_issue(repo, remote, key, checkout, work_dir, owner, issue):
                       "independently understandable tasks suitable for a small language model. "
                       "For each task give what, why, a detailed algorithm and implementation policy, "
                       "and concrete automated test cases to add for each task. Include basic, functional, "
-                      "and integration tests. If essential requirements are "
+                      "and integration tests runnable locally in the worktree without GitHub API "
+                      "or external network access. The controller checks existing PR metadata and "
+                      "writes PR-numbered work records after PR creation; exclude those from "
+                      "integration_tests. If essential requirements are "
                       "missing, return focused questions in the questions field and do not guess. "
                       "Otherwise return an empty questions array. Research relevant current "
                       "theory, official documentation, and existing code when available. "
@@ -710,8 +772,7 @@ def process_issue(repo, remote, key, checkout, work_dir, owner, issue):
             if index > 1:
                 run(["git", "switch", "-c", branch], cwd=worktree)
                 created_branches.append(branch)
-            existing_url = existing_task_pr(repo, branch, previous_branch,
-                                            subtasks[index - 1], task["what"])
+            existing_url = existing_task_pr(repo, branch, previous_branch, subtasks[index - 1])
             if existing_url:
                 run(["git", "fetch", remote, branch], cwd=checkout, env=git_env)
                 fetched_commit = run(["git", "rev-parse", "FETCH_HEAD"], cwd=checkout)
@@ -722,7 +783,7 @@ def process_issue(repo, remote, key, checkout, work_dir, owner, issue):
                             existing_url.rsplit("/", 1)[-1])).is_file()):
                     raise RuntimeError("Existing PR is missing its work record: " + existing_url)
                 pr_urls.append(existing_url)
-                close_completed_subtask(repo, subtasks[index - 1], number, existing_url)
+                record_completed_subtask(repo, subtasks[index - 1], number, existing_url)
                 previous_branch = branch
                 continue
             implementation_prompt = (
@@ -744,7 +805,10 @@ def process_issue(repo, remote, key, checkout, work_dir, owner, issue):
             if not run(["git", "status", "--porcelain"], cwd=worktree):
                 raise RuntimeError("Codex produced no changes for sub-issue #{}".format(subtasks[index - 1]))
             final_task = index == len(plan["tasks"])
-            integration_checks = plan["integration_tests"] if final_task else [task["tests"]]
+            integration_checks = (local_integration_checks(plan["integration_tests"])
+                                  if final_task else [task["tests"]])
+            if not integration_checks:
+                integration_checks = [task["tests"]]
             verify_prompt = (
                 "Review only task {} (sub-issue #{}) for parent issue #{}. Ensure this task "
                 "adds or extends an automated test case for its behavior; add a missing case "
@@ -753,8 +817,11 @@ def process_issue(repo, remote, key, checkout, work_dir, owner, issue):
                 "{} Report the added test case with task number {}, file, name, and behavior. "
                 "For each basic, functional, and integration category report the actual command, "
                 "observed output or result summary, and pass status. Set passed=true only if "
-                "all required tests actually ran and passed. Do not commit, push, change GitHub "
-                "issues, or merge. If any check cannot run, set passed=false and explain why.\n\n"
+                "all required local tests actually ran and passed. PR state, base branch, and "
+                "PR-numbered work records are checked or written by the controller; do not call "
+                "gh or treat unavailable GitHub API access as a test failure. Do not commit, push, "
+                "change GitHub issues, or merge. If a required local check cannot run, set "
+                "passed=false and explain why.\n\n"
                 "Task:\n{}\n\nRequired integration checks:\n{}"
             ).format(index, subtasks[index - 1], number,
                      "Run every parent integration test now." if final_task else
@@ -797,7 +864,7 @@ def process_issue(repo, remote, key, checkout, work_dir, owner, issue):
                 run(["git", "push", remote, "HEAD:refs/heads/{}".format(branch)],
                     cwd=worktree, env=git_env)
             pr_urls.append(pr_url)
-            close_completed_subtask(repo, subtasks[index - 1], number, pr_url)
+            record_completed_subtask(repo, subtasks[index - 1], number, pr_url)
             previous_branch = branch
         gh(repo, "issue", "edit", str(number), "--add-label", "done", "--remove-label", "swfactory:running")
         try:
@@ -867,6 +934,10 @@ def main():
         if args.scan:
             scan_repository(repo, checkout, work_dir)
         while True:
+            try:
+                reconcile_merged_issues(repo, owner)
+            except Exception as error:
+                print("Merge reconciliation failed: {}".format(error), file=sys.stderr)
             resume_answered_issues(repo, owner, bot)
             for issue in pending_rephrase_issues(repo):
                 try:
