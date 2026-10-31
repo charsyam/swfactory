@@ -80,23 +80,27 @@ class PlanTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "changed test file"):
                 swfactory.validate_verification(result, worktree, 1)
 
-    def test_issue_numbered_work_records_follow_subissue_numbers(self):
+    def test_work_record_uses_pr_number_and_links_issues(self):
         with tempfile.TemporaryDirectory() as directory:
             worktree = Path(directory)
             (worktree / "AGENTS.md").write_text(
                 "Record work-items.md and docs/{work number}.md for each change.\n")
-            (worktree / "work-items.md").write_text("| 14 | First task |\n| 15 | Second task |\n")
-            (worktree / "docs").mkdir()
-            (worktree / "docs/14.md").write_text("First task\n")
-            (worktree / "docs/15.md").write_text("Second task\n")
-            swfactory.validate_issue_numbered_records(worktree, [14, 15])
-            (worktree / "docs/15.md").unlink()
-            with self.assertRaisesRegex(RuntimeError, "Missing docs/15.md"):
-                swfactory.validate_issue_numbered_records(worktree, [14, 15])
-            (worktree / "docs/15.md").write_text("Second task\n")
-            (worktree / "work-items.md").write_text("| 14 | First task |\n")
-            with self.assertRaisesRegex(RuntimeError, "Missing work-items.md row"):
-                swfactory.validate_issue_numbered_records(worktree, [14, 15])
+            plan = {"summary": "Feature", "why": "Needed", "tasks": [{
+                "what": "Implement check", "why": "Reliability", "how": "Validate config",
+                "tests": "Check valid and invalid config"}], "integration_tests": ["CLI smoke"]}
+            self.assertTrue(swfactory.write_pr_work_item(
+                worktree, "https://github.com/owner/repo/pull/23", 14, [15],
+                "Add doctor", plan, "## Test results\nPASS"))
+            record = (worktree / "docs/23.md").read_text()
+            self.assertIn("# Work #23", record)
+            self.assertIn("/issues/14", record)
+            self.assertIn("/issues/15", record)
+            self.assertIn("PASS", record)
+            self.assertIn("| 23 |", (worktree / "work-items.md").read_text())
+            self.assertFalse((worktree / "docs/15.md").exists())
+            with self.assertRaisesRegex(RuntimeError, "already exists"):
+                swfactory.write_pr_work_item(worktree, "https://github.com/owner/repo/pull/23",
+                                              14, [15], "Add doctor", plan, "PASS")
 
     @patch("swfactory.run")
     def test_repo_view_passes_repository_as_argument(self, run):

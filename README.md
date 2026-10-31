@@ -38,7 +38,7 @@ Every open issue without `rephased` is rewritten on the next run, without requir
 
 The tool creates `accept`, `done`, `rephased`, `swfactory:running`, `swfactory:waiting`, `swfactory:failed`, `swfactory:subtask`, and `refactor` labels if needed. If information is missing, it comments with an `@` mention and adds `swfactory:waiting`. Reply **on that issue as `OWNER_GITHUB_HANDLE`**; the next run detects the answer, removes the waiting label, and replans. It posts a complete plan on the issue before implementation, creates GitHub sub-issues, and adds direct links to them in the parent issue body above `==== original ====`. Every implemented sub-task must add or extend an automated test case; verification runs basic, functional, and integration tests and records their commands and results in the PR and parent issue. If a run fails, it comments on the issue and adds `swfactory:failed`; remove that label after fixing the cause to retry. If the process is interrupted, remove a stale `swfactory:running` label to retry. Review and merge the PR yourself.
 
-When a target repository requires `work-items.md` and `docs/{work number}.md`, the work number is the GitHub sub-issue number. The PR has its own number and is linked from the work record and GitHub issue. Before publishing a PR, swfactory verifies that each sub-issue has the matching document and table row.
+When a target repository requires `work-items.md` and `docs/{work number}.md`, the work number is the implementation PR number. Issue and sub-issue numbers remain separate task identifiers linked from that PR's work record.
 
 ## Periodic execution
 
