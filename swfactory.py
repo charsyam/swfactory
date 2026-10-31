@@ -2,6 +2,7 @@
 """Process approved GitHub issues with the local Codex CLI."""
 
 import argparse
+from dataclasses import dataclass
 import fcntl
 import hashlib
 import json
@@ -13,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import Optional, Tuple
 
 
 ROOT = Path(__file__).resolve().parent
@@ -120,41 +122,112 @@ def run(args, *, cwd=ROOT, env=None, input_text=None, capture=True):
     return (result.stdout or "").strip()
 
 
-def config(repository_override=None, project_override=None):
+@dataclass(frozen=True)
+class Configuration:
+    repository: Optional[str]
+    remote: str
+    key: Optional[Path]
+    project: Optional[Path]
+    work_dir: Optional[Path]
+
+
+@dataclass(frozen=True)
+class ConfigurationFinding:
+    name: str
+    message: str
+
+
+@dataclass(frozen=True)
+class ConfigurationResult:
+    values: Configuration
+    findings: Tuple[ConfigurationFinding, ...]
+
+
+def read_env_values(path):
+    """Parse env without exposing its contents in errors or output."""
     values = {}
-    for line in (ROOT / "env").read_text().splitlines():
+    try:
+        lines = path.read_text().splitlines()
+    except (OSError, UnicodeError):
+        return values, ConfigurationFinding("env", "Cannot read env; create a readable env file")
+    for line in lines:
         if not line or line.lstrip().startswith("#"):
             continue
         key, separator, value = line.partition("=")
         if separator:
             values[key.strip()] = value.strip().strip('"\'')
+    return values, None
+
+
+def validate_configuration(repository_override=None, project_override=None):
+    """Select and validate local settings without creating directories."""
+    values, env_finding = read_env_values(ROOT / "env")
+    findings = [env_finding] if env_finding else []
     remote = repository_override or values.get("GITHUB_REPOGITORY", "")
     match = re.fullmatch(r"git@github\.com:([^/]+/[^/]+?)(?:\.git)?", remote)
     if not match:
-        raise RuntimeError("env must contain GITHUB_REPOGITORY=git@github.com:owner/repo.git")
-    key = Path(values.get("GITHUB_SSH_KEY_PATH", "")).expanduser()
-    if not key.is_file():
-        raise RuntimeError("GITHUB_SSH_KEY_PATH does not point to a file")
+        findings.append(ConfigurationFinding(
+            "GITHUB_REPOGITORY", "env must contain GITHUB_REPOGITORY=git@github.com:owner/repo.git"))
+    key = None
+    key_value = values.get("GITHUB_SSH_KEY_PATH", "")
+    if key_value:
+        try:
+            key = Path(key_value).expanduser()
+        except (OSError, RuntimeError, ValueError):
+            pass
+    if key is None or not key.is_file():
+        findings.append(ConfigurationFinding(
+            "GITHUB_SSH_KEY_PATH", "GITHUB_SSH_KEY_PATH does not point to a file"))
     project_value = project_override or values.get("PROJECT_PATH", "")
+    project = None
     if not project_value:
-        raise RuntimeError("Set PROJECT_PATH in env or pass --project-path")
-    project = Path(project_value).expanduser().resolve()
-    if not project.is_dir():
-        raise RuntimeError("PROJECT_PATH is not an existing directory")
-    top_level = Path(run(["git", "rev-parse", "--show-toplevel"], cwd=project)).resolve()
-    if project != top_level:
-        raise RuntimeError("PROJECT_PATH must be the target Git repository root")
-    origin = run(["git", "remote", "get-url", "origin"], cwd=project)
-    origin_match = re.fullmatch(
-        r"(?:git@github\.com:|https://github\.com/)([^/]+/[^/]+?)(?:\.git)?/?", origin)
-    if not origin_match or origin_match.group(1).casefold() != match.group(1).casefold():
-        raise RuntimeError("PROJECT_PATH origin does not match GITHUB_REPOGITORY")
+        findings.append(ConfigurationFinding("PROJECT_PATH", "Set PROJECT_PATH in env or pass --project-path"))
+    else:
+        try:
+            project = Path(project_value).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            pass
+        if project is None or not project.is_dir():
+            findings.append(ConfigurationFinding("PROJECT_PATH", "PROJECT_PATH is not an existing directory"))
     work_value = values.get("WORK_DIR", "/tmp") or "/tmp"
-    work_dir = Path(work_value).expanduser().resolve()
-    if work_dir == project or project in work_dir.parents:
-        raise RuntimeError("WORK_DIR must be outside PROJECT_PATH")
+    work_dir = None
+    try:
+        work_dir = Path(work_value).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        findings.append(ConfigurationFinding("WORK_DIR", "WORK_DIR is not a valid path"))
+    if project is not None and project.is_dir():
+        try:
+            top_level = Path(run(["git", "rev-parse", "--show-toplevel"], cwd=project)).resolve()
+        except (OSError, RuntimeError, ValueError):
+            findings.append(ConfigurationFinding("PROJECT_PATH", "PROJECT_PATH is not a Git repository root"))
+        else:
+            if project != top_level:
+                findings.append(ConfigurationFinding("PROJECT_PATH", "PROJECT_PATH must be the target Git repository root"))
+            try:
+                origin = run(["git", "remote", "get-url", "origin"], cwd=project)
+            except (OSError, RuntimeError):
+                findings.append(ConfigurationFinding("PROJECT_PATH", "PROJECT_PATH does not have an origin remote"))
+            else:
+                origin_match = re.fullmatch(
+                    r"(?:git@github\.com:|https://github\.com/)([^/]+/[^/]+?)(?:\.git)?/?", origin)
+                if match and (not origin_match or origin_match.group(1).casefold() != match.group(1).casefold()):
+                    findings.append(ConfigurationFinding(
+                        "PROJECT_PATH", "PROJECT_PATH origin does not match GITHUB_REPOGITORY"))
+    if project is not None and work_dir is not None and (work_dir == project or project in work_dir.parents):
+        findings.append(ConfigurationFinding("WORK_DIR", "WORK_DIR must be outside PROJECT_PATH"))
+    return ConfigurationResult(
+        Configuration(match.group(1) if match else None, remote, key, project, work_dir),
+        tuple(findings))
+
+
+def config(repository_override=None, project_override=None):
+    result = validate_configuration(repository_override, project_override)
+    if result.findings:
+        raise RuntimeError(result.findings[0].message)
+    selected = result.values
+    work_dir = selected.work_dir
     work_dir.mkdir(parents=True, exist_ok=True)
-    return match.group(1), remote, key, project, work_dir
+    return selected.repository, selected.remote, selected.key, selected.project, work_dir
 
 
 def isolate_github_auth(repo):
