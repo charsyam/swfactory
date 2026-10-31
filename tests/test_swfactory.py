@@ -611,6 +611,8 @@ class ScanTests(unittest.TestCase):
 
         def write_output(_prompt, _cwd, output_path, _schema_path, read_only):
             self.assertTrue(read_only)
+            proposals["inspection"] = {"path": "module.py", "sha256": swfactory.hashlib.sha256(
+                (_cwd / "module.py").read_bytes()).hexdigest()}
             output_path.write_text(json.dumps(proposals))
 
         codex.side_effect = write_output
@@ -638,7 +640,8 @@ class ScanTests(unittest.TestCase):
         pages.return_value = [{"title": "Old wording", "state": "closed",
                                "body": "<!-- swfactory-scan-key:{} -->".format(key)}]
         codex.side_effect = lambda _prompt, _cwd, output, _schema, read_only: output.write_text(
-            json.dumps({"issues": [proposal]}))
+            json.dumps({"inspection": {"path": "module.py", "sha256": swfactory.hashlib.sha256(
+                (_cwd / "module.py").read_bytes()).hexdigest()}, "issues": [proposal]}))
         with tempfile.TemporaryDirectory() as directory:
             (Path(directory) / "module.py").write_text("def function():\n    pass\n")
             swfactory.scan_repository("owner/repo", Path(directory), Path(directory))
@@ -652,9 +655,32 @@ class ScanTests(unittest.TestCase):
                     "how": "C", "tests": "D", "path": "../secret", "symbol": "secret",
                     "evidence": "secret"}
         codex.side_effect = lambda _prompt, _cwd, output, _schema, read_only: output.write_text(
-            json.dumps({"issues": [proposal]}))
+            json.dumps({"inspection": {"path": "module.py", "sha256": swfactory.hashlib.sha256(
+                (_cwd / "module.py").read_bytes()).hexdigest()}, "issues": [proposal]}))
         with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "module.py").write_text("def function():\n    pass\n")
             swfactory.scan_repository("owner/repo", Path(directory), Path(directory))
+        gh.assert_not_called()
+
+    @patch("swfactory.api_pages")
+    @patch("swfactory.gh")
+    @patch("swfactory.codex")
+    def test_scan_rejects_empty_findings_without_verified_inspection(self, codex, gh, pages):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "module.py").write_text("VALUE = 1\n")
+            for inspection in ({}, {"path": "module.py", "sha256": "0" * 64},
+                               {"path": "../module.py", "sha256": "0" * 64}):
+                codex.side_effect = lambda _prompt, _cwd, output, _schema, read_only: (
+                    output.write_text(json.dumps({"inspection": inspection, "issues": []})))
+                with self.assertRaises(RuntimeError):
+                    swfactory.scan_repository("owner/repo", root, root)
+            valid = {"path": "module.py", "sha256": swfactory.hashlib.sha256(
+                (root / "module.py").read_bytes()).hexdigest()}
+            codex.side_effect = lambda _prompt, _cwd, output, _schema, read_only: (
+                output.write_text(json.dumps({"inspection": valid, "issues": []})))
+            swfactory.scan_repository("owner/repo", root, root)
+        pages.assert_called_once()
         gh.assert_not_called()
 
     @patch("swfactory.default_branch", return_value="main")
@@ -760,7 +786,8 @@ class IsolationTests(unittest.TestCase):
             child_env = run.call_args.kwargs["env"]
             self.assertEqual(args[0:2], ["docker", "run"])
             self.assertIn("--ignore-user-config", args)
-            self.assertIn("read-only", args)
+            self.assertIn("danger-full-access", args)
+            self.assertIn("--read-only", args)
             self.assertIn("type=bind,src={},dst={},readonly".format(root, root), args)
             self.assertIn("type=bind,src=/isolated/git,dst=/isolated/git,readonly", args)
             self.assertIn("type=bind,src=/isolated/auth,dst=/codex-home", args)
