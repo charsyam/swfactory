@@ -1,6 +1,6 @@
 # swfactory
 
-`swfactory` is a controller for **other GitHub repositories**. It takes a target repository's open issues labeled `accept` in issue-number order. It uses the installed `codex exec` CLI to turn each issue into small GitHub sub-issues, implements them sequentially in a temporary worktree, runs task and integration tests, pushes a branch to the target repository, and opens a PR there. It closes completed sub-issues and adds `done` to the parent when the PR is ready. **It never merges the PR.**
+`swfactory` is a controller for **other GitHub repositories**. It takes a target repository's open issues labeled `accept` in issue-number order. It uses the installed `codex exec` CLI to turn each issue into small GitHub sub-issues, implements them sequentially in a temporary worktree, runs task and integration tests, pushes a branch to the target repository, and opens a PR there. It adds `done` when implementation is ready and closes related issues after their PRs are merged. **It never merges the PR.**
 
 ## Setup
 
@@ -36,10 +36,11 @@ python3 swfactory.py                # process current accepted issues once
 python3 swfactory.py --watch        # poll every 60 seconds
 python3 swfactory.py --watch --interval 120
 python3 swfactory.py --scan         # propose bug/refactor issues, then process accepted issues
+python3 swfactory.py --scan-if-changed  # scan the latest default-branch commit once, if changed
 python3 swfactory.py --project-path /path/to/ANOTHER-PROJECT --repository git@github.com:OWNER/ANOTHER-PROJECT.git
 ```
 
-The tool uses the existing local target checkout and creates only an issue-specific temporary Git worktree under `WORK_DIR`. `--repository` and `--project-path` override the target settings from `env` for one run. The `swfactory` source checkout is never used as the target workspace unless explicitly configured as the target. `--scan` reads the local target checkout and proposes concrete bug/refactor issues there. It does not add `accept`; review each proposal and apply that label yourself. Existing issue titles are skipped to limit duplicate proposals.
+The tool uses the existing local target checkout and creates temporary Git worktrees under `WORK_DIR`. `--repository` and `--project-path` override the target settings from `env` for one run. The `swfactory` source checkout is never used as the target workspace unless explicitly configured as the target. `--scan` fetches and inspects a detached snapshot of the target's latest default branch. `--scan-if-changed` does the same only when the remote commit or scan policy differs from the last successful scan, recorded under `WORK_DIR`; it is intended for scheduled use. Scanned findings require a source path, code identifier, and verbatim evidence. The tool checks both open and closed issues for a stable finding key and matching titles before posting, so reworded proposals for the same code location do not recur. It does not add `accept`; review each proposal and apply that label yourself. The key groups findings by kind, path, and identifier, so distinct findings in the same function and category should be reviewed within one issue.
 
 ## Rewrite an initial issue
 
@@ -62,5 +63,11 @@ Use the one-shot command from cron. The local lock prevents overlapping runs of 
 ```
 
 Install the chosen line with `crontab -e`. The scheduled job runs only when the machine is available; an always-on runner is needed if missed periods must be processed immediately. `--watch` is available for a continuously running process instead of cron.
+
+To propose code-derived issues once per day, add a second entry at a different time after the version containing `--scan-if-changed` is deployed:
+
+```cron
+0 2 * * * /bin/zsh -lc 'cd /Users/daemyung/develop/charsyam/swfactory && python3 swfactory.py --scan-if-changed >> /tmp/swfactory-scan.log 2>&1'
+```
 
 Run local checks with `python3 -m unittest discover -s tests -v`.

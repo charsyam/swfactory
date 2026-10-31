@@ -598,12 +598,15 @@ class DoctorCommandTests(unittest.TestCase):
             self.assertFalse(work.exists())
 
 class ScanTests(unittest.TestCase):
+    @patch("swfactory.api_pages")
     @patch("swfactory.gh")
     @patch("swfactory.codex")
-    def test_scan_creates_unaccepted_nonduplicate_issue(self, codex, gh):
+    def test_scan_creates_unaccepted_nonduplicate_issue(self, codex, gh, pages):
         proposals = {"issues": [
-            {"title": "Existing", "kind": "bug", "what": "A", "why": "B", "how": "C", "tests": "D"},
-            {"title": "New finding", "kind": "refactor", "what": "A", "why": "B", "how": "C", "tests": "D"},
+            {"title": "Existing", "kind": "bug", "what": "A", "why": "B", "how": "C", "tests": "D",
+             "path": "module.py", "symbol": "function", "evidence": "def function()"},
+            {"title": "New finding", "kind": "refactor", "what": "A", "why": "B", "how": "C", "tests": "D",
+             "path": "module.py", "symbol": "function", "evidence": "def function()"},
         ]}
 
         def write_output(_prompt, _cwd, output_path, _schema_path, read_only):
@@ -611,15 +614,113 @@ class ScanTests(unittest.TestCase):
             output_path.write_text(json.dumps(proposals))
 
         codex.side_effect = write_output
-        gh.side_effect = [json.dumps([{"title": "Existing"}]), "https://github.com/owner/repo/issues/2"]
+        pages.return_value = [{"title": "Existing", "body": "", "state": "closed"}]
+        gh.return_value = "https://github.com/owner/repo/issues/2"
         with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "module.py").write_text("def function():\n    pass\n")
             swfactory.scan_repository("owner/repo", Path(directory), Path(directory))
             self.assertEqual(codex.call_args.args[1], Path(directory))
-        self.assertEqual(gh.call_count, 2)
+        self.assertEqual(gh.call_count, 1)
         create_args = gh.call_args.args
         self.assertIn("--label", create_args)
         self.assertIn("refactor", create_args)
         self.assertNotIn("accept", create_args)
+        self.assertIn("swfactory-scan-key:", create_args[create_args.index("--body") + 1])
+
+    @patch("swfactory.api_pages")
+    @patch("swfactory.gh")
+    @patch("swfactory.codex")
+    def test_scan_skips_existing_key_even_when_title_changes(self, codex, gh, pages):
+        proposal = {"title": "Different wording", "kind": "bug", "what": "A", "why": "B",
+                    "how": "C", "tests": "D", "path": "module.py", "symbol": "function",
+                    "evidence": "def function()"}
+        key = swfactory.hashlib.sha256(b"bug:module.py:function").hexdigest()
+        pages.return_value = [{"title": "Old wording", "state": "closed",
+                               "body": "<!-- swfactory-scan-key:{} -->".format(key)}]
+        codex.side_effect = lambda _prompt, _cwd, output, _schema, read_only: output.write_text(
+            json.dumps({"issues": [proposal]}))
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "module.py").write_text("def function():\n    pass\n")
+            swfactory.scan_repository("owner/repo", Path(directory), Path(directory))
+        gh.assert_not_called()
+
+    @patch("swfactory.api_pages", return_value=[])
+    @patch("swfactory.gh")
+    @patch("swfactory.codex")
+    def test_scan_rejects_source_outside_snapshot(self, codex, gh, _pages):
+        proposal = {"title": "Invalid path", "kind": "bug", "what": "A", "why": "B",
+                    "how": "C", "tests": "D", "path": "../secret", "symbol": "secret",
+                    "evidence": "secret"}
+        codex.side_effect = lambda _prompt, _cwd, output, _schema, read_only: output.write_text(
+            json.dumps({"issues": [proposal]}))
+        with tempfile.TemporaryDirectory() as directory:
+            swfactory.scan_repository("owner/repo", Path(directory), Path(directory))
+        gh.assert_not_called()
+
+    @patch("swfactory.default_branch", return_value="main")
+    @patch("swfactory.scan_repository")
+    def test_changed_remote_commit_is_scanned_without_changing_checkout(self, scan, _branch):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            remote = root / "remote.git"
+            checkout = root / "checkout"
+            publisher = root / "publisher"
+            work = root / "work"
+            work.mkdir()
+            swfactory.run(["git", "init", "--bare", str(remote)])
+            swfactory.run(["git", "init", "-b", "main", str(checkout)])
+            swfactory.run(["git", "config", "user.name", "Test"], cwd=checkout)
+            swfactory.run(["git", "config", "user.email", "test@example.com"], cwd=checkout)
+            (checkout / "source.py").write_text("OLD = 1\n")
+            swfactory.run(["git", "add", "source.py"], cwd=checkout)
+            swfactory.run(["git", "commit", "-m", "Old"], cwd=checkout)
+            original = swfactory.run(["git", "rev-parse", "HEAD"], cwd=checkout)
+            swfactory.run(["git", "push", str(remote), "main"], cwd=checkout)
+            swfactory.run(["git", "--git-dir", str(remote), "symbolic-ref", "HEAD",
+                           "refs/heads/main"])
+            swfactory.run(["git", "clone", str(remote), str(publisher)])
+            swfactory.run(["git", "config", "user.name", "Test"], cwd=publisher)
+            swfactory.run(["git", "config", "user.email", "test@example.com"], cwd=publisher)
+            (publisher / "source.py").write_text("NEW = 2\n")
+            swfactory.run(["git", "add", "source.py"], cwd=publisher)
+            swfactory.run(["git", "commit", "-m", "New"], cwd=publisher)
+            swfactory.run(["git", "push", "origin", "main"], cwd=publisher)
+            seen = []
+            scan.side_effect = lambda _repo, snapshot, _work: seen.append(
+                (snapshot / "source.py").read_text())
+            self.assertTrue(swfactory.scan_latest_repository(
+                "owner/repo", str(remote), root / "unused-key", checkout, work, if_changed=True))
+            self.assertEqual(seen, ["NEW = 2\n"])
+            self.assertFalse(swfactory.scan_latest_repository(
+                "owner/repo", str(remote), root / "unused-key", checkout, work, if_changed=True))
+            self.assertEqual(len(seen), 1)
+            self.assertTrue(swfactory.scan_latest_repository(
+                "owner/repo", str(remote), root / "unused-key", checkout, work))
+            self.assertEqual(len(seen), 2)
+            self.assertEqual(swfactory.run(["git", "rev-parse", "HEAD"], cwd=checkout), original)
+            self.assertEqual(swfactory.run(["git", "status", "--porcelain"], cwd=checkout), "")
+
+    @patch("swfactory.default_branch", return_value="main")
+    @patch("swfactory.scan_repository", side_effect=RuntimeError("scan failed"))
+    def test_failed_scan_does_not_record_successful_commit(self, _scan, _branch):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            remote = root / "remote.git"
+            checkout = root / "checkout"
+            work = root / "work"
+            work.mkdir()
+            swfactory.run(["git", "init", "--bare", str(remote)])
+            swfactory.run(["git", "init", "-b", "main", str(checkout)])
+            swfactory.run(["git", "config", "user.name", "Test"], cwd=checkout)
+            swfactory.run(["git", "config", "user.email", "test@example.com"], cwd=checkout)
+            (checkout / "source.py").write_text("VALUE = 1\n")
+            swfactory.run(["git", "add", "source.py"], cwd=checkout)
+            swfactory.run(["git", "commit", "-m", "Init"], cwd=checkout)
+            swfactory.run(["git", "push", str(remote), "main"], cwd=checkout)
+            with self.assertRaisesRegex(RuntimeError, "scan failed"):
+                swfactory.scan_latest_repository("owner/repo", str(remote), root / "key",
+                                                 checkout, work, if_changed=True)
+            self.assertEqual(list(work.glob(".swfactory-scan-*.json")), [])
 
 
 class QuestionTests(unittest.TestCase):
