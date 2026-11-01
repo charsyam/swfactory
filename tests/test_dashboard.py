@@ -60,6 +60,99 @@ class EventStoreTests(unittest.TestCase):
             self.assertIn('"status": "failed"', serialized)
             self.assertIn('"recipient": "planner"', serialized)
 
+    def test_codex_success_links_handoff_and_elapsed_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = dashboard.EventStore(root / "telemetry.sqlite3")
+            run_id = store.start_run("owner/repo", "once")
+            observer = dashboard.RunObserver(store, "owner/repo", run_id)
+            with patch.object(swfactory, "OBSERVER", observer), \
+                    patch("swfactory.git_common_dir", return_value=root / ".git"), \
+                    patch("swfactory.codex_auth_dir", return_value=root / "auth"), \
+                    patch("swfactory.codex_container_image", return_value="test-image"), \
+                    patch("swfactory.run", return_value=""):
+                with swfactory.trace_scope("planner", 42, 1, ("issue body",),
+                                           ("https://github.com/owner/repo/issues/42",)):
+                    agent_id = swfactory.codex("PRIVATE PROMPT", root, read_only=True)
+            events = [event for event in store.snapshot("owner/repo")["events"]
+                      if event["agent_id"] == agent_id]
+            self.assertEqual([event["kind"] for event in reversed(events)],
+                             ["agent_started", "agent_finished"])
+            self.assertEqual(events[0]["details"]["result"], "worktree")
+            self.assertGreaterEqual(events[0]["details"]["elapsed_ms"], 0)
+            self.assertEqual(events[1]["details"]["references"],
+                             ["https://github.com/owner/repo/issues/42"])
+            self.assertNotIn("PRIVATE PROMPT", json.dumps(events))
+
+    def test_issue_workflow_links_calls_results_and_pages_long_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = dashboard.EventStore(Path(directory) / "telemetry.sqlite3")
+            run_id = store.start_run("owner/repo", "once")
+            record = lambda kind, actor, recipient=None, task=None, agent=None, status=None, details=None: (
+                store.record(run_id, "owner/repo", kind, actor, recipient, 42, task, agent,
+                             status, kind, details or {}))
+            record("issue_started", "controller", "github", status="running")
+            record("plan_ready", "planner", "controller", agent="plan-call",
+                   status="completed", details={"task_count": 2, "plan_sha256": "abc"})
+            record("subtasks_registered", "controller", "github", status="completed",
+                   details={"issue_numbers": [61, 62]})
+            record("agent_started", "controller", "implementer", task=1, agent="code-call",
+                   status="running", details={"sources": ["task specification"],
+                                              "references": ["https://github.com/owner/repo/issues/61"]})
+            record("agent_finished", "implementer", "controller", task=1, agent="code-call",
+                   status="completed", details={"result": "worktree", "elapsed_ms": 1275})
+            record("tests_verified", "verifier", "controller", task=1, agent="verify-call",
+                   status="completed", details={"test_case_count": 3,
+                                                "categories": ["basic", "functional", "integration"]})
+            record("performance_measurement", "benchmark", "controller", task=1,
+                   status="completed", details={"metric": "latency", "target": 10,
+                                                "baseline": 20, "candidate": "A", "value": 9,
+                                                "unit": "ms", "attempt": 2})
+            record("pr_created", "controller", "github", task=1, status="completed",
+                   details={"url": "https://github.com/owner/repo/pull/77"})
+            for index in range(230):
+                record("progress", "controller", task=1, details={"sequence": index})
+            store.record(run_id, "owner/repo", "issue_failed", "controller", None, 43,
+                         None, None, "failed", "Other issue failed", {})
+            latest = store.issue_list("owner/repo")
+            self.assertEqual([item["issue_number"] for item in latest[:2]], [43, 42])
+            self.assertEqual([item["status"] for item in latest[:2]], ["failed", "running"])
+            first = store.issue_snapshot("owner/repo", 42)
+            self.assertEqual(first["issue_number"], 42)
+            self.assertEqual(len(first["events"]), 100)
+            self.assertIsNotNone(first["next_cursor"])
+            self.assertEqual(first["calls"][0]["elapsed_ms"], 1275)
+            self.assertEqual(first["calls"][0]["references"],
+                             ["https://github.com/owner/repo/issues/61"])
+            self.assertEqual(first["performance"][0]["details"]["value"], 9)
+            self.assertIn("pr_created", [item["kind"] for item in first["artifacts"]])
+            self.assertEqual({item["key"]: item["status"] for item in first["stages"]}["review"],
+                             "completed")
+            older = store.issue_snapshot("owner/repo", 42, before=first["next_cursor"])
+            self.assertLess(older["events"][0]["id"], first["events"][-1]["id"])
+            self.assertEqual(store.issue_snapshot("owner/repo", 999), None)
+            with self.assertRaises(ValueError):
+                store.issue_snapshot("owner/repo", 0)
+
+    def test_failure_reason_and_retry_state_are_separate_from_old_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = dashboard.EventStore(Path(directory) / "telemetry.sqlite3")
+            run_id = store.start_run("owner/repo", "once")
+            store.record(run_id, "owner/repo", "plan_ready", "planner", "controller",
+                         8, None, "call-1", "completed", "Plan", {"task_count": 1})
+            store.record(run_id, "owner/repo", "issue_failed", "controller", None,
+                         8, None, None, "failed", "Issue failed",
+                         {"reason_code": "required_tests_failed", "error_type": "RuntimeError"})
+            failed = store.issue_snapshot("owner/repo", 8)
+            self.assertEqual(failed["status"], "failed")
+            self.assertEqual(failed["failure"]["reason_code"], "required_tests_failed")
+            self.assertEqual({s["key"]: s["status"] for s in failed["stages"]}["plan"], "failed")
+            store.record(run_id, "owner/repo", "issue_started", "controller", "github",
+                         8, None, None, "running", "Retry", {})
+            retry = store.issue_snapshot("owner/repo", 8)
+            self.assertEqual(retry["status"], "running")
+            self.assertIsNone(retry["failure"])
+
 
 class DashboardHttpTests(unittest.TestCase):
     def test_loopback_api_is_read_only_and_html_escapes_dynamic_data(self):
@@ -90,6 +183,19 @@ class DashboardHttpTests(unittest.TestCase):
                 status, script = request("GET", "/app.js")
                 self.assertEqual(status, 200)
                 self.assertIn(b"textContent", script)
+                status, issues = request("GET", "/api/issues")
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(issues)[0]["issue_number"], 42)
+                status, detail = request("GET", "/api/issues/42")
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(detail)["issue_number"], 42)
+                self.assertEqual(request("GET", "/issue/42")[0], 200)
+                status, detail_script = request("GET", "/detail.js")
+                self.assertEqual(status, 200)
+                self.assertIn(b"textContent", detail_script)
+                self.assertNotIn(b"innerHTML", detail_script)
+                self.assertEqual(request("GET", "/api/issues/0")[0], 404)
+                self.assertEqual(request("GET", "/api/issues/42?before=bad")[0], 400)
                 self.assertEqual(request("POST", "/api/state")[0], 405)
                 self.assertEqual(request("GET", "/api/state", "example.com")[0], 400)
             finally:
