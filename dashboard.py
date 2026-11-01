@@ -68,7 +68,7 @@ class GitHubSnapshot:
                 return self.data
             self.next_refresh = time.monotonic() + self.ttl
             try:
-                issues = self._list("issue", "number,title,state,labels,updatedAt,url,body")
+                issues = self._list("issue", "number,title,state,labels,updatedAt,url")
                 pulls = self._list("pr", "number,title,state,isDraft,mergedAt,updatedAt,url,closingIssuesReferences")
                 issue_numbers = {item["number"] for item in issues}
                 for issue in issues:
