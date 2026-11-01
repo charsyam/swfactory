@@ -20,7 +20,7 @@ import time
 from typing import Optional, Tuple
 from uuid import uuid4
 
-from dashboard import EventStore, RunObserver, make_server
+from dashboard import EventStore, GitHubSnapshot, RunObserver, make_server
 
 
 ROOT = Path(__file__).resolve().parent
@@ -1526,7 +1526,8 @@ def main():
             parser.error("--port must be between 0 and 65535")
         repo = selected.values.repository
         db_path = git_common_dir(selected.values.project) / "swfactory" / "telemetry.sqlite3"
-        server = make_server(EventStore(db_path), repo, args.port)
+        server = make_server(EventStore(db_path), repo, args.port,
+                             GitHubSnapshot(repo, isolate_github_auth(repo)))
         print("Dashboard: http://127.0.0.1:{}".format(server.server_port), flush=True)
         try:
             server.serve_forever()

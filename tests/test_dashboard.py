@@ -154,6 +154,38 @@ class EventStoreTests(unittest.TestCase):
             self.assertIsNone(retry["failure"])
 
 
+class GitHubSnapshotTests(unittest.TestCase):
+    def test_existing_issues_subtasks_and_prs_are_connected_without_body_storage(self):
+        client = dashboard.GitHubSnapshot("owner/repo", "/tmp/project-gh", ttl=60)
+        issues = [
+            {"number": 10, "title": "Parent", "state": "OPEN", "updatedAt": "2026-01-01",
+             "url": "https://github.com/owner/repo/issues/10", "body": "secret prompt",
+             "labels": [{"name": "accept"}]},
+            {"number": 11, "title": "[#10 task 1] <script>bad()</script>", "state": "OPEN",
+             "updatedAt": "2026-01-02", "url": "https://github.com/owner/repo/issues/11",
+             "body": "private issue body", "labels": [{"name": "swfactory:subtask"}]},
+        ]
+        pulls = [{"number": 12, "title": "Implement task", "state": "OPEN",
+                  "isDraft": False, "mergedAt": None, "updatedAt": "2026-01-03",
+                  "url": "https://github.com/owner/repo/pull/12",
+                  "closingIssuesReferences": [{"number": 11}]}]
+        with patch.object(client, "_list", side_effect=[issues, pulls]) as fetch:
+            result = client.snapshot()
+            self.assertEqual(client.snapshot(), result)
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(result["issues"][0]["children"], [11])
+        self.assertEqual(result["issues"][1]["parent"], 10)
+        self.assertEqual(result["issues"][1]["pull_requests"], [12])
+        self.assertEqual(result["pull_requests"][0]["issues"], [11])
+        self.assertNotIn("body", json.dumps(result))
+        with patch.object(client, "_list", side_effect=RuntimeError("token text")):
+            client.next_refresh = 0
+            cached = client.snapshot()
+        self.assertEqual(cached["error"], "RuntimeError")
+        self.assertNotIn("token text", json.dumps(cached))
+        self.assertEqual(cached["issues"][0]["children"], [11])
+
+
 class DashboardHttpTests(unittest.TestCase):
     def test_loopback_api_is_read_only_and_html_escapes_dynamic_data(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -186,6 +218,9 @@ class DashboardHttpTests(unittest.TestCase):
                 status, issues = request("GET", "/api/issues")
                 self.assertEqual(status, 200)
                 self.assertEqual(json.loads(issues)[0]["issue_number"], 42)
+                status, github = request("GET", "/api/github")
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(github)["error"], "not_configured")
                 status, detail = request("GET", "/api/issues/42")
                 self.assertEqual(status, 200)
                 self.assertEqual(json.loads(detail)["issue_number"], 42)
@@ -224,9 +259,11 @@ class DashboardHttpTests(unittest.TestCase):
             with patch.object(sys, "argv", ["swfactory.py", "dashboard", "--port", "0"]), \
                     patch("swfactory.validate_configuration", return_value=selected), \
                     patch("swfactory.make_server", return_value=ShortServer()) as make, \
-                    patch("swfactory.isolate_github_auth", side_effect=AssertionError("auth")):
+                    patch("swfactory.isolate_github_auth", return_value=root / "auth") as auth:
                 swfactory.main()
             self.assertEqual(make.call_args.args[1], "owner/repo")
+            auth.assert_called_once_with("owner/repo")
+            self.assertIsInstance(make.call_args.args[3], dashboard.GitHubSnapshot)
             self.assertEqual(make.call_args.args[0].path,
                              (project / ".git" / "swfactory" / "telemetry.sqlite3").resolve())
             self.assertFalse((root / "work").exists())

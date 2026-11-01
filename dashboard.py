@@ -4,9 +4,13 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
+import subprocess
+from threading import Lock
+import time
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
@@ -33,6 +37,65 @@ STAGE_FOR_KIND = {
 ARTIFACT_KINDS = {"plan_ready", "continuity_checked", "subtasks_registered",
                   "implementation_result", "tests_verified",
                   "pr_created", "pr_reused", "subtask_closed", "issue_closed"}
+
+
+class GitHubSnapshot:
+    """Short-lived, read-only GitHub cache; never stores issue bodies or comments."""
+
+    def __init__(self, repo, config_dir, ttl=60):
+        self.repo, self.config_dir, self.ttl = repo, str(config_dir), ttl
+        self.lock = Lock()
+        self.next_refresh = 0
+        self.data = {"repo": repo, "synced_at": None, "error": None,
+                     "issues": [], "pull_requests": []}
+
+    def _list(self, noun, fields):
+        env = os.environ.copy()
+        env.pop("GH_TOKEN", None)
+        env.pop("GITHUB_TOKEN", None)
+        env["GH_CONFIG_DIR"] = self.config_dir
+        completed = subprocess.run(
+            ["gh", noun, "list", "--repo", self.repo, "--state", "all",
+             "--limit", "1000", "--json", fields], capture_output=True, text=True,
+            timeout=20, env=env, check=False)
+        if completed.returncode:
+            raise RuntimeError("github_query_failed")
+        return json.loads(completed.stdout)
+
+    def snapshot(self):
+        with self.lock:
+            if time.monotonic() < self.next_refresh:
+                return self.data
+            self.next_refresh = time.monotonic() + self.ttl
+            try:
+                issues = self._list("issue", "number,title,state,labels,updatedAt,url,body")
+                pulls = self._list("pr", "number,title,state,isDraft,mergedAt,updatedAt,url,closingIssuesReferences")
+                issue_numbers = {item["number"] for item in issues}
+                for issue in issues:
+                    labels = {label["name"] for label in issue.pop("labels", [])}
+                    issue["labels"] = sorted(labels)
+                    issue["parent"] = None
+                    match = re.match(r"^\[#([1-9][0-9]*) task [1-9][0-9]*\]", issue["title"])
+                    if "swfactory:subtask" in labels and match:
+                        issue["parent"] = int(match.group(1))
+                    issue.pop("body", None)
+                    issue["pull_requests"] = []
+                    issue["children"] = []
+                by_number = {item["number"]: item for item in issues}
+                for issue in issues:
+                    if issue["parent"] in issue_numbers:
+                        by_number[issue["parent"]]["children"].append(issue["number"])
+                for pull in pulls:
+                    pull["issues"] = sorted({item["number"] for item in
+                                             pull.pop("closingIssuesReferences", [])
+                                             if item.get("number") in issue_numbers})
+                    for number in pull["issues"]:
+                        by_number[number]["pull_requests"].append(pull["number"])
+                self.data = {"repo": self.repo, "synced_at": now(), "error": None,
+                             "issues": issues, "pull_requests": pulls}
+            except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
+                self.data = {**self.data, "error": type(error).__name__}
+            return self.data
 
 
 def now():
@@ -279,6 +342,10 @@ HTML = """<!doctype html><html lang="en"><meta charset="utf-8">
 <section class="cards"><article><h2>Running</h2><strong id="running">0</strong></article>
 <article><h2>Active Codex calls</h2><strong id="active-count">0</strong></article>
 <article><h2>Last result</h2><strong id="last-result">—</strong></article></section>
+<section><h2>GitHub work queue</h2><p id="github-sync" class="hint">Loading GitHub…</p>
+<div class="queue-cards"><article><strong id="queue-awaiting">0</strong><span>Awaiting approval</span></article><article><strong id="queue-accepted">0</strong><span>Accepted</span></article><article><strong id="queue-review">0</strong><span>Ready for review</span></article><article><strong id="queue-failed">0</strong><span>Failed</span></article></div>
+<div id="github-issues"></div></section>
+<section><h2>Pull requests</h2><div id="github-pulls"></div></section>
 <section><h2>Issue workflows</h2><p class="hint">Open an issue to follow its plan, tasks, calls, tests, and PRs.</p><div id="workflows"></div></section>
 <section><h2>Active calls</h2><div id="active" class="empty">No active calls</div></section>
 <section><h2>Information flow</h2><p class="hint">Structured handoffs and results. Prompts, comments, keys, and full tool output are not stored.</p>
@@ -286,6 +353,7 @@ HTML = """<!doctype html><html lang="en"><meta charset="utf-8">
 <section><h2>Recent runs</h2><div id="runs"></div></section></div>
 <div id="issue-detail" hidden><p><a href="/">← All workflows</a> · <a id="github-issue" href="#">GitHub issue</a></p>
 <h2 id="issue-title"></h2><p id="issue-status" class="status"></p><p id="failure-reason" class="status failed" hidden></p>
+<section><h2>GitHub state</h2><p id="github-detail-sync" class="hint"></p><div id="github-detail"></div></section>
 <section><h2>Stages</h2><div id="stages" class="stage-grid"></div></section>
 <section><h2>Agent handoffs</h2><p class="hint">Input references and recorded outputs, connected by call ID.</p><div id="calls"></div></section>
 <section><h2>Results and references</h2><div id="artifacts"></div></section>
@@ -304,9 +372,10 @@ article,section:not(.cards){background:white;border:1px solid #d9e0d9;border-rad
 .status.failed,.status.interrupted{color:#b04430}.meta{font-size:12px;color:#62736e}.empty{color:#62736e;padding:12px 0}a{color:#14684e}
 .workflow,.call,.artifact,.measurement{border-top:1px solid #e4e9e4;padding:14px 0}.workflow:first-child,.call:first-child,.artifact:first-child,.measurement:first-child{border-top:0}
 .workflow{display:flex;justify-content:space-between;gap:20px}.workflow a{font-weight:700}.stage-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(135px,1fr));gap:10px}
+.queue-cards{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.queue-cards article{background:#f7f9f6;border:1px solid #d9e0d9;border-radius:9px;padding:12px}.queue-cards strong{display:block;font-size:25px}.queue-cards span{font-size:12px;color:#62736e}.gh-row{display:grid;grid-template-columns:75px 1fr auto;gap:12px;border-top:1px solid #e4e9e4;padding:11px 0;align-items:start}.gh-row:first-child{border-top:0}.gh-row .meta{display:block}.label{display:inline-block;background:#eef2ed;border-radius:5px;padding:1px 6px;margin:2px 3px 2px 0;font-size:11px}.gh-detail-row{padding:7px 0;border-top:1px solid #e4e9e4}
 .stage{border:1px solid #d9e0d9;border-radius:9px;padding:12px;background:#f7f9f6}.stage.completed{border-color:#8fbda5}.stage.failed{border-color:#d79b91;background:#fff7f5}.stage.running{border-color:#b8a9e8}
 .stage .status{display:block;margin-top:5px}.call strong,.artifact strong{display:block}button{background:#183c32;color:white;border:0;border-radius:7px;padding:9px 14px;cursor:pointer;margin-top:12px}
-@media(max-width:700px){.cards{grid-template-columns:1fr}.event,.run{grid-template-columns:1fr 1fr}.event .summary,.run .summary{grid-column:1/-1}header{display:block}}
+@media(max-width:700px){.cards,.queue-cards{grid-template-columns:1fr 1fr}.event,.run{grid-template-columns:1fr 1fr}.event .summary,.run .summary{grid-column:1/-1}.gh-row{grid-template-columns:55px 1fr}header{display:block}}
 """
 
 JS = """const byId=id=>document.getElementById(id);
@@ -321,6 +390,13 @@ const extras=Object.entries(e.details||{}).filter(([key])=>!['sources','url','pr
 const url=e.details?.url||e.details?.pr_url;if(typeof url==='string'&&/^https:\/\/github\.com\/[-A-Za-z0-9_.]+\/[-A-Za-z0-9_.]+\/pull\/\d+$/.test(url)){const a=node('a','PR #'+url.split('/').pop());a.href=url;meta.append(' · ',a)}
 middle.append(meta);row.append(middle,node('span',e.status||'','status '+(e.status||'')));return row}
 function runRow(r){const row=node('div','','run');row.append(node('time',r.started_at,'meta'),node('span',r.mode,'flow'),node('span',r.id.slice(0,12),'summary muted'),node('span',r.status,'status '+r.status));return row}
+function issueState(i){if(i.state==='CLOSED')return 'closed';if(i.labels.includes('swfactory:failed'))return 'failed';if(i.labels.includes('swfactory:running'))return 'running';if(i.labels.includes('done'))return 'review';if(i.labels.includes('accept'))return 'accepted';return 'awaiting approval'}
+function ghRow(i){const row=node('div','','gh-row');const link=node('a','#'+i.number);link.href='/issue/'+i.number;const content=node('div');content.append(node('div',i.title));const meta=node('small','','meta');meta.append('Updated '+i.updatedAt);if(i.parent)meta.append(' · Parent #'+i.parent);if(i.children.length)meta.append(' · '+i.children.length+' subtasks');if(i.pull_requests.length)meta.append(' · PR '+i.pull_requests.map(n=>'#'+n).join(', '));content.append(meta);row.append(link,content,node('span',issueState(i),'status'));return row}
+function prRow(p,repo){const row=node('div','','gh-row');const link=node('a','#'+p.number);link.href='https://github.com/'+repo+'/pull/'+p.number;const content=node('div');content.append(node('div',p.title),node('small','Issues '+(p.issues.length?p.issues.map(n=>'#'+n).join(', '):'not linked')+' · Updated '+p.updatedAt,'meta'));row.append(link,content,node('span',p.mergedAt?'merged':p.isDraft?'draft':p.state.toLowerCase(),'status'));return row}
+async function refreshGithub(){try{const response=await fetch('/api/github',{cache:'no-store'});if(!response.ok)throw Error('HTTP '+response.status);const gh=await response.json();byId('github-sync').textContent=gh.synced_at?'GitHub checked '+gh.synced_at+(gh.error?' · last query failed; showing cached data':''):'GitHub unavailable'+(gh.error?' ('+gh.error+')':'');
+const top=gh.issues.filter(i=>!i.parent&&i.state==='OPEN');for(const [id,state] of [['queue-awaiting','awaiting approval'],['queue-accepted','accepted'],['queue-review','review'],['queue-failed','failed']])byId(id).textContent=top.filter(i=>issueState(i)===state).length;
+const visible=[...top,...gh.issues.filter(i=>!i.parent&&i.state==='CLOSED').slice(0,10)];show(byId('github-issues'),visible,ghRow,'No GitHub issues available');show(byId('github-pulls'),gh.pull_requests.filter(p=>p.state==='OPEN').slice(0,30),p=>prRow(p,gh.repo),'No open pull requests');
+}catch(error){byId('github-sync').textContent='GitHub query failed: '+error.message}}
 async function refresh(){try{const response=await fetch('/api/state',{cache:'no-store'});if(!response.ok)throw Error('HTTP '+response.status);const data=await response.json();
 byId('repo').textContent=data.repo;byId('updated').textContent='Updated '+new Date().toLocaleTimeString();byId('running').textContent=data.runs.filter(r=>r.status==='running').length;
 byId('active-count').textContent=data.active_agents.length;byId('last-result').textContent=data.runs[0]?.status||'—';
@@ -328,16 +404,24 @@ show(byId('active'),data.active_agents,e=>eventRow(e,data.repo),'No active calls
 const issues=await (await fetch('/api/issues',{cache:'no-store'})).json();show(byId('workflows'),issues,i=>{const row=node('div','','workflow');const a=node('a','Issue #'+i.issue_number);a.href='/issue/'+i.issue_number;row.append(a,node('span',i.summary+' · '+i.event_count+' events · '+i.at,'meta'),node('span',i.status||i.kind,'status '+(i.status||'')));return row},'No issue history recorded yet');
 }catch(error){byId('updated').textContent='Could not load dashboard: '+error.message}}
 refresh();setInterval(refresh,5000);
+refreshGithub();setInterval(refreshGithub,60000);
 """
 
 DETAIL_JS = """const issueMatch=location.pathname.match(/^\\/issue\\/([1-9][0-9]*)$/);
 if(issueMatch){byId('overview').hidden=true;byId('issue-detail').hidden=false;
 const issueNumber=Number(issueMatch[1]);let older=[];let cursor=null;let latest=null;
-function renderDetail(data){latest=data;byId('repo').textContent=data.repo;byId('issue-title').textContent='Issue #'+data.issue_number;
-byId('issue-status').textContent=data.status;byId('issue-status').className='status '+data.status;
+function renderDetail(data,gh){latest=data;byId('repo').textContent=data.repo;const issue=gh.issues.find(i=>i.number===issueNumber);byId('issue-title').textContent=issue?'Issue #'+issueNumber+' · '+issue.title:'Issue #'+issueNumber;
+byId('issue-status').textContent=issue?issueState(issue):data.status;byId('issue-status').className='status '+(issue?issueState(issue):data.status);
+byId('github-detail-sync').textContent=gh.synced_at?'GitHub checked '+gh.synced_at+(gh.error?' · cached':''):'GitHub unavailable';
+const ghDetail=byId('github-detail');ghDetail.replaceChildren();if(issue){const labels=node('div');labels.append(node('strong','Labels: '));issue.labels.forEach(label=>labels.append(node('span',label,'label')));ghDetail.append(labels);
+if(issue.parent){const line=node('div','','gh-detail-row');line.append('Parent: ');const a=node('a','#'+issue.parent);a.href='/issue/'+issue.parent;line.append(a);ghDetail.append(line)}
+if(issue.children.length){const line=node('div','','gh-detail-row');line.append('Subtasks: ');issue.children.forEach((n,index)=>{if(index)line.append(', ');const a=node('a','#'+n);a.href='/issue/'+n;line.append(a)});ghDetail.append(line)}
+const linked=gh.pull_requests.filter(p=>issue.pull_requests.includes(p.number));if(linked.length){const line=node('div','','gh-detail-row');line.append('Pull requests: ');linked.forEach((p,index)=>{if(index)line.append(' · ');const a=node('a','#'+p.number+' '+(p.mergedAt?'merged':p.state.toLowerCase()));a.href='https://github.com/'+gh.repo+'/pull/'+p.number;line.append(a)});ghDetail.append(line)}
+ghDetail.append(node('div','Updated '+issue.updatedAt,'meta'))}else ghDetail.append(node('p','Issue not present in the current GitHub snapshot','empty'));
 const failure=data.failure;byId('failure-reason').hidden=!failure;byId('failure-reason').textContent=failure?'Failure: '+(failure.reason_code||failure.error_type||'See issue timeline'):'';
 byId('github-issue').href='https://github.com/'+data.repo+'/issues/'+data.issue_number;
-show(byId('stages'),data.stages,s=>{const el=node('div','','stage '+s.status);el.append(node('strong',s.label),node('span',s.status,'status '+s.status),node('small',s.event_count+' events'+(s.last_at?' · '+s.last_at:''),'meta'));return el},'No stages');
+const inferred=issue&&!data.stages.length?[['Specification',issue.labels.includes('rephased')],['Plan',false],['Subtasks',issue.children.length>0],['Implementation',issue.pull_requests.length>0],['Experiments',false],['Tests',false],['Pull requests',issue.pull_requests.length>0],['Merge',issue.state==='CLOSED']].map(([label,observed])=>({label,status:observed?'observed':'unknown',event_count:0,last_at:null})):data.stages;
+show(byId('stages'),inferred,s=>{const el=node('div','','stage '+s.status);el.append(node('strong',s.label),node('span',s.status,'status '+s.status),node('small',s.event_count?s.event_count+' events'+(s.last_at?' · '+s.last_at:''):'GitHub state only','meta'));return el},'No stages');
 show(byId('calls'),data.calls,c=>{const el=node('div','','call');const duration=c.elapsed_ms==null?'in progress':c.elapsed_ms+' ms';
 el.append(node('strong',c.role+' · '+c.status+' · '+duration),node('div','Call '+c.id.slice(0,12)+(c.task_number?' · Task '+c.task_number:''),'meta'));
 el.append(node('div','Input: '+(c.sources.length?c.sources.join(', '):'No source categories recorded')));
@@ -353,13 +437,14 @@ show(byId('performance'),data.performance,m=>{const el=node('div','','measuremen
 for(const key of ['target','baseline','candidate','value','unit','status'])if(d[key]!=null)el.append(node('div',key+': '+d[key],'meta'));return el},'No performance experiments recorded');
 const combined=[...data.events,...older].filter((item,index,array)=>array.findIndex(other=>other.id===item.id)===index).sort((a,b)=>b.id-a.id);
 show(byId('issue-events'),combined,e=>eventRow(e,data.repo),'No issue events');byId('load-older').hidden=!cursor;byId('updated').textContent='Updated '+new Date().toLocaleTimeString()}
-async function loadDetail(){try{const response=await fetch('/api/issues/'+issueNumber,{cache:'no-store'});if(!response.ok)throw Error('HTTP '+response.status);const data=await response.json();if(!older.length)cursor=data.next_cursor;renderDetail(data)}catch(error){byId('issue-title').textContent='Could not load issue: '+error.message}}
-byId('load-older').addEventListener('click',async()=>{if(!cursor)return;const response=await fetch('/api/issues/'+issueNumber+'?before='+cursor,{cache:'no-store'});if(!response.ok)return;const page=await response.json();older.push(...page.events);cursor=page.next_cursor;renderDetail(latest)});
+let latestGh=null;
+async function loadDetail(){try{const [localResponse,ghResponse]=await Promise.all([fetch('/api/issues/'+issueNumber,{cache:'no-store'}),fetch('/api/github',{cache:'no-store'})]);if(!ghResponse.ok)throw Error('GitHub HTTP '+ghResponse.status);const gh=await ghResponse.json();if(!localResponse.ok&&localResponse.status!==404)throw Error('History HTTP '+localResponse.status);const data=localResponse.ok?await localResponse.json():{repo:gh.repo,issue_number:issueNumber,status:'unobserved',failure:null,stages:[],calls:[],artifacts:[],performance:[],events:[],next_cursor:null};if(!localResponse.ok&&!gh.issues.some(i=>i.number===issueNumber))throw Error('Issue not found');latestGh=gh;if(!older.length)cursor=data.next_cursor;renderDetail(data,gh)}catch(error){byId('issue-title').textContent='Could not load issue: '+error.message}}
+byId('load-older').addEventListener('click',async()=>{if(!cursor)return;const response=await fetch('/api/issues/'+issueNumber+'?before='+cursor,{cache:'no-store'});if(!response.ok)return;const page=await response.json();older.push(...page.events);cursor=page.next_cursor;renderDetail(latest,latestGh)});
 loadDetail();setInterval(loadDetail,5000)}
 """
 
 
-def make_server(store, repo, port=8765):
+def make_server(store, repo, port=8765, github=None):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             host = self.headers.get("Host", "").split(":", 1)[0]
@@ -370,6 +455,11 @@ def make_server(store, repo, port=8765):
             path = parsed.path
             if path == "/api/state":
                 body, mime = json.dumps(store.snapshot(repo), ensure_ascii=False).encode(), "application/json"
+            elif path == "/api/github":
+                data = github.snapshot() if github else {"repo": repo, "synced_at": None,
+                                                         "error": "not_configured", "issues": [],
+                                                         "pull_requests": []}
+                body, mime = json.dumps(data, ensure_ascii=False).encode(), "application/json"
             elif path == "/api/issues":
                 body, mime = json.dumps(store.issue_list(repo), ensure_ascii=False).encode(), "application/json"
             elif re.fullmatch(r"/api/issues/[1-9][0-9]*", path):
