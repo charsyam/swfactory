@@ -161,7 +161,7 @@ class GitHubSnapshotTests(unittest.TestCase):
             {"number": 10, "title": "Parent", "state": "OPEN", "updatedAt": "2026-01-01",
              "url": "https://github.com/owner/repo/issues/10", "body": "secret prompt",
              "labels": [{"name": "accept"}]},
-            {"number": 11, "title": "[#10 task 1] <script>bad()</script>", "state": "OPEN",
+            {"number": 11, "title": "<script>bad()</script>", "state": "OPEN",
              "updatedAt": "2026-01-02", "url": "https://github.com/owner/repo/issues/11",
              "body": "private issue body", "labels": [{"name": "swfactory:subtask"}]},
         ]
@@ -169,7 +169,8 @@ class GitHubSnapshotTests(unittest.TestCase):
                   "isDraft": False, "mergedAt": None, "updatedAt": "2026-01-03",
                   "url": "https://github.com/owner/repo/pull/12",
                   "closingIssuesReferences": [{"number": 11}]}]
-        with patch.object(client, "_list", side_effect=[issues, pulls]) as fetch:
+        with patch.object(client, "_list", side_effect=[issues, pulls]) as fetch, \
+                patch.object(client, "_subissues", return_value=[11]):
             result = client.snapshot()
             self.assertEqual(client.snapshot(), result)
         self.assertEqual(fetch.call_count, 2)
@@ -184,6 +185,36 @@ class GitHubSnapshotTests(unittest.TestCase):
         self.assertEqual(cached["error"], "RuntimeError")
         self.assertNotIn("token text", json.dumps(cached))
         self.assertEqual(cached["issues"][0]["children"], [11])
+
+    def test_board_prioritizes_owner_decisions_and_inherits_subtask_prs(self):
+        def issue(number, labels, children=(), parent=None, prs=(), state="OPEN"):
+            return {"number": number, "title": "Issue {}".format(number), "labels": labels,
+                    "children": list(children), "parent": parent, "pull_requests": list(prs),
+                    "state": state, "updatedAt": "2026-01-01"}
+        github = {"repo": "owner/repo", "synced_at": "2026-01-01", "error": None,
+                  "issues": [issue(1, ["swfactory:waiting", "accept"]),
+                             issue(2, ["swfactory:failed", "accept"], children=[8]),
+                             issue(3, ["done"], children=[9]),
+                             issue(4, ["accept"]), issue(5, ["rephased"]),
+                             issue(6, ["done"], state="CLOSED"),
+                             issue(8, ["swfactory:subtask"], parent=2),
+                             issue(9, ["swfactory:subtask"], parent=3, prs=[10])],
+                  "pull_requests": [{"number": 10, "title": "Task PR", "state": "OPEN",
+                                     "mergedAt": None, "updatedAt": "2026-01-01", "issues": [9]},
+                                    {"number": 11, "title": "Unlinked", "state": "OPEN",
+                                     "mergedAt": None, "updatedAt": "2026-01-01", "issues": []}]}
+        telemetry = {"issues": [{"issue_number": 3, "status": "ready", "event_count": 7}],
+                     "active_agents": [], "runs": []}
+        board = dashboard.build_board(github, telemetry)
+        self.assertEqual([row["number"] for row in board["groups"]["answer"]], [1])
+        self.assertEqual([row["number"] for row in board["groups"]["recover"]], [2])
+        self.assertEqual([row["number"] for row in board["groups"]["review"]], [3])
+        self.assertEqual([row["number"] for row in board["groups"]["approve"]], [5])
+        self.assertEqual([row["number"] for row in board["groups"]["queued"]], [4])
+        self.assertEqual(board["groups"]["review"][0]["open_prs"], [10])
+        self.assertEqual(board["groups"]["review"][0]["local_events"], 7)
+        self.assertEqual(board["unlinked_prs"][0]["number"], 11)
+        self.assertEqual(board["groups"]["completed"][0]["number"], 6)
 
 
 class DashboardHttpTests(unittest.TestCase):
@@ -221,6 +252,9 @@ class DashboardHttpTests(unittest.TestCase):
                 status, github = request("GET", "/api/github")
                 self.assertEqual(status, 200)
                 self.assertEqual(json.loads(github)["error"], "not_configured")
+                status, board = request("GET", "/api/board")
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(board)["history_count"], 1)
                 status, detail = request("GET", "/api/issues/42")
                 self.assertEqual(status, 200)
                 self.assertEqual(json.loads(detail)["issue_number"], 42)
