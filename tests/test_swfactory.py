@@ -474,6 +474,7 @@ class DoctorCommandTests(unittest.TestCase):
     def fixture(self, root):
         script = root / "swfactory.py"
         shutil.copyfile(swfactory.__file__, script)
+        shutil.copyfile(Path(swfactory.__file__).with_name("dashboard.py"), root / "dashboard.py")
         key = root / "key"
         key.write_text("secret-key-sentinel")
         project = root / "project"
