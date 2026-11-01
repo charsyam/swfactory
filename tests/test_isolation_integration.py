@@ -38,6 +38,27 @@ class DockerIsolationIntegrationTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual((workspace / "probe").exists(), not read_only)
 
+    def test_container_temporary_directory_can_execute_test_fixtures(self):
+        with tempfile.TemporaryDirectory(prefix="swfactory-temp-exec-", dir="/tmp") as directory:
+            root = Path(directory).resolve()
+            workspace, metadata, auth = (root / name for name in ("workspace", "metadata", "auth"))
+            for path in (workspace, metadata, auth):
+                path.mkdir()
+            command = swfactory.codex_container_command(
+                workspace, metadata, auth, set(), True, "swfactory-codex:0.166.0")
+            script = ("printf '#!/bin/sh\\nexit 0\\n' > /var/tmp/probe; "
+                      "chmod 755 /var/tmp/probe; test -x /var/tmp/probe && /var/tmp/probe")
+            result = subprocess.run(command + ["/bin/sh", "-c", script], text=True,
+                                    capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_container_has_offline_doctor_prerequisites(self):
+        result = subprocess.run(["docker", "run", "--rm", "--pull", "never",
+                                 "swfactory-codex:0.166.0", "/bin/sh", "-c",
+                                 "command -v gh && command -v ssh"], text=True,
+                                capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_live_codex_resists_fake_credential_instruction_and_can_write(self):
         with tempfile.TemporaryDirectory(prefix="swfactory-live-boundary-", dir="/tmp") as directory:
             root = Path(directory).resolve()

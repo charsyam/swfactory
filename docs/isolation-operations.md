@@ -16,6 +16,10 @@ The controller retains GitHub API credentials and the configured SSH key on the 
 
 The container root filesystem is read-only. The worktree is read-only for rephrase, scan, and plan calls, and writable for implementation and verification. Git metadata is always mounted read-only. Only the Codex login and result directory have separate writable mounts. The controller's `GH_CONFIG_DIR`, GitHub tokens, SSH key, and SSH agent are absent from the container environment and mounts.
 
+The private `/var/tmp` tmpfs permits execution because Python tests create temporary executable fixtures there. It remains inside the container and does not expose host paths.
+
+The default image includes `gh` and `ssh` so offline doctor tests can discover them. GitHub CLI authentication files and the configured SSH private key remain on the host and are not mounted.
+
 Codex runs with its inner `danger-full-access` mode because its Linux sandbox cannot initialize reliably inside this container. The Docker mounts above enforce the read-only and writable boundaries. A scan must return a source file path and SHA-256 digest matching the snapshot; otherwise the controller fails the scan and leaves its commit eligible for retry.
 
 For writable calls, Codex uses its `danger-full-access` inner mode because the nested `workspace-write` mode rejected file writes in the tested Mac Docker runtime. The outer Docker container still limits host file access to the explicit mounts. The Codex login is available to code running in the container; use a dedicated Codex account or a narrower authentication method if that credential also needs protection from generated code.
