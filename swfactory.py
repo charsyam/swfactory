@@ -460,7 +460,7 @@ def codex_container_command(cwd, common_dir, auth_dir, result_dirs, read_only, i
     command = ["docker", "run", "--rm", "-i", "--pull", "never",
                "--user", "{}:{}".format(uid, gid), "--read-only", "--cap-drop", "ALL",
                "--security-opt", "no-new-privileges", "--pids-limit", "256",
-               "--tmpfs", "/var/tmp:rw,uid={},gid={},mode=700".format(uid, gid),
+               "--tmpfs", "/var/tmp:rw,exec,uid={},gid={},mode=700".format(uid, gid),
                "--mount", "type=bind,src={},dst={}{}".format(
                    cwd, cwd, ",readonly" if read_only else ""),
                "--mount", "type=bind,src={},dst={},readonly".format(common_dir, common_dir),

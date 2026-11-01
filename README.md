@@ -12,7 +12,7 @@ Codex runs inside a local Docker container so repository content and tests canno
 docker build -f docker/Codex.Dockerfile -t swfactory-codex:0.166.0 .
 ```
 
-The image includes Codex CLI 0.166.0, Python, Git, and ripgrep. For another project's test dependencies, build an image with those tools and set `CODEX_CONTAINER_IMAGE` in `env`. Docker is required for every Codex call; if it or the selected image is unavailable, work stops without falling back to a host Codex process. The local Codex login must have a file-backed `auth.json` under `CODEX_HOME` (default `~/.codex`). On first use swfactory copies only that file to a private per-target Codex home, where token refreshes persist. [Official Codex authentication guidance](https://learn.chatgpt.com/docs/auth?surface=cli) describes file-backed login and its credential handling.
+The image includes Codex CLI 0.166.0, Python, Git, ripgrep, `gh`, and `ssh`. The controller still keeps GitHub authentication and its SSH key outside the container. For another project's test dependencies, build an image with those tools and set `CODEX_CONTAINER_IMAGE` in `env`. Docker is required for every Codex call; if it or the selected image is unavailable, work stops without falling back to a host Codex process. The local Codex login must have a file-backed `auth.json` under `CODEX_HOME` (default `~/.codex`). On first use swfactory copies only that file to a private per-target Codex home, where token refreshes persist. [Official Codex authentication guidance](https://learn.chatgpt.com/docs/auth?surface=cli) describes file-backed login and its credential handling.
 
 Create an untracked `env` file next to `swfactory.py`:
 
